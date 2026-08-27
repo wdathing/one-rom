@@ -1,0 +1,6 @@
+{
+    "name": "drivewire",
+    "display_name": "DriveWire Bridge",
+    "description": "Bridges a CoCo/Dragon DriveWire session to a real DriveWire server over One ROM's RP2350 UART1",
+    "build_output": "build/drivewire_plugin.bin"
+}
