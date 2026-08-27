@@ -487,6 +487,18 @@ static void pio_setup_address_monitor_dma(
     dma_reg->ctrl_trig =
         DMA_CTRL_TRIG_EN |
         dma_data_size |
+        // High priority: this channel and the ROM-serving DMA channels are
+        // otherwise equal-priority round-robin peers on the AHB matrix, but
+        // serving is effectively always pending (every CPU read needs it
+        // serviced in time to present valid data), so a sustained burst of
+        // reads - e.g. a target CPU's own boot sequence, well before it ever
+        // touches this plugin's protocol - can starve this channel's 4-deep
+        // hardware RX FIFO of AHB grants long enough to overflow it, silently
+        // losing captures with no trace downstream.  Confirmed in practice on
+        // the drivewire plugin: a ring-buffer backlog high-water-mark
+        // diagnostic pegged at the maximum representable value during a
+        // target's boot, consistent with exactly this.
+        DMA_CTRL_TRIG_PRIORITY_HIGH |
         DMA_CTRL_RING_SIZE(ring_size_log2) |
         DMA_CTRL_RING_SEL |
         DMA_CTRL_INCR_WRITE |
