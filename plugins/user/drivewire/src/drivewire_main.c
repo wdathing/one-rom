@@ -219,15 +219,6 @@ static volatile uint32_t s_debug_session_count;
 // somewhere - it has genuinely stopped running any code at all.
 static volatile uint32_t s_debug_heartbeat;
 
-// The first up to 8 bytes drivewire_do_write() has relayed to UART1 TX in
-// its most recent session (s_debug_last_count says how many total - only
-// the first 8 are kept here).  Lets `onerom inspect peek memory` confirm
-// whether a write session that completed on this side actually relayed the
-// bytes hdbdos intended (e.g. a 5-byte HREAD request should read D2 00 00 00
-// 00 for LSN 0), as opposed to relaying something malformed that the server
-// silently ignores rather than logging as an unrecognised opcode.
-static volatile uint8_t s_debug_write_bytes[8];
-
 // Bring-up diagnostic only: every matched knock's data, for reading back via
 // `onerom inspect peek memory` instead of manually transcribing UART output
 // (error-prone - single-character transcription slips, e.g. a stray '9' for
@@ -245,6 +236,12 @@ static volatile uint8_t  s_debug_knock_window[KNOCK_LEN];
 // live protocol on the wire (confirmed: a checksum error of exactly 0x0D0A,
 // i.e. "\r\n", turned up server-side, matching this dump's own line prefix).
 static volatile uint16_t s_debug_last_count;
+
+// Set the instant a session's count byte is known, before drivewire_do_write()
+// /drivewire_do_read() is even called - unlike s_debug_last_count above,
+// this is visible while a session is still stuck in progress, to see what
+// count a hung read/write was actually trying to handle.
+static volatile uint16_t s_debug_current_count;
 
 // Checksum of what drivewire_do_read() actually received over UART1 into
 // s_read_buf, computed right after its own initial drain completes and
@@ -558,9 +555,6 @@ static uint32_t drivewire_next_addr_skip_ack(void) {
 static void drivewire_do_write(uint16_t count) {
     for (uint16_t i = 0; i < count; i++) {
         uint8_t b = (uint8_t)(drivewire_next_addr() & 0xFFu);
-        if (i < sizeof(s_debug_write_bytes)) {
-            s_debug_write_bytes[i] = b;
-        }
         drivewire_uart_putc(b);
     }
 
@@ -935,6 +929,7 @@ void drivewire_main(
         s_debug_main_phase = 1u;
         uint32_t raw_count = drivewire_next_addr_skip_ack() & 0xFFu;
         uint16_t count = (raw_count == 0u) ? 256u : (uint16_t)raw_count;
+        s_debug_current_count = count;
 
         if (dir == SESSION_WRITE) {
             s_debug_main_phase = 2u;
