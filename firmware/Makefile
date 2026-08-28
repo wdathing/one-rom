@@ -84,6 +84,9 @@ endif
 ifeq ($(DEBUG_LOGGING), 1)
 	CFLAGS += -DDEBUG_LOGGING=1
 endif
+ifeq ($(UART_BOOT_TEST), 1)
+	CFLAGS += -DUART_BOOT_TEST=1
+endif
 
 # Rebuild every object when the compiler flags change.
 #
