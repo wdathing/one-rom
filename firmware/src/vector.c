@@ -7,6 +7,119 @@
 #if !defined(TEST_BUILD)
 
 #include "include.h"
+#include "reg-rp235x.h"
+
+// r4-r11 are callee-saved, so they are never part of the hardware-stacked
+// exception frame - they keep whatever value they held at the fault instant
+// until something overwrites them, so the naked trampolines below must save
+// them before any C code (which is free to use r4-r11 as scratch) runs.
+typedef struct {
+    uint32_t r4, r5, r6, r7, r8, r9, r10, r11;
+} callee_saved_t;
+
+// ---------------------------------------------------------------------------
+// Fault diagnostics - UART1 register dump
+// ---------------------------------------------------------------------------
+//
+// Bring-up diagnostic only: the fault handlers below transmit CFSR/HFSR/
+// MMFAR/BFAR out UART1 (GPIO40 TX / GPIO41 RX - the drivewire plugin's own
+// pins) before they start blinking, since blink-pattern counting alone
+// wasn't reliably distinguishing which exception fired.  Always reconfigures
+// UART1 from scratch rather than trusting whatever a crashed plugin left
+// behind - a fault that happens before a plugin finishes its own UART bring
+// up must not be silent.
+#define FAULT_UART_BASE    UART1_BASE
+#define FAULT_UART_TX_GPIO 40u
+#define FAULT_UART_RX_GPIO 41u
+#define FAULT_UART_BAUD    115200u
+
+static void fault_uart_putc(uint8_t b) {
+    while (UART_REG(FAULT_UART_BASE, UART_FR_OFFSET) & UART_FR_TXFF) { }
+    UART_REG(FAULT_UART_BASE, UART_DR_OFFSET) = b;
+}
+
+static void fault_uart_puts(const char *s) {
+    while (*s) fault_uart_putc((uint8_t)*s++);
+}
+
+static void fault_uart_put_hex32(uint32_t v) {
+    static const char digits[] = "0123456789ABCDEF";
+    for (int shift = 28; shift >= 0; shift -= 4) {
+        fault_uart_putc((uint8_t)digits[(v >> shift) & 0xFu]);
+    }
+}
+
+static void fault_uart_init(void) {
+    // clk_peri must be running before UART1's reset can complete - see
+    // drivewire_uart_init()'s equivalent comment in the plugin.
+    CLOCK_PERI_CTRL = CLOCK_PERI_CTRL_ENABLE;
+
+    RESET_RESET_SET = RESET_UART1;
+    RESET_RESET_CLR = RESET_UART1;
+    while (!(RESET_DONE & RESET_UART1)) { }
+
+    GPIO_CTRL(FAULT_UART_TX_GPIO) = GPIO_CTRL_FUNC_UART;
+    GPIO_CTRL(FAULT_UART_RX_GPIO) = GPIO_CTRL_FUNC_UART;
+    // PAD_INPUT set on TX too, not just RX - confirmed against the SDK's own
+    // gpio_set_function(), which enables the pad input buffer unconditionally
+    // on every pin, output-only or not.
+    GPIO_PAD(FAULT_UART_TX_GPIO) = (GPIO_PAD(FAULT_UART_TX_GPIO) | PAD_INPUT) & ~(uint32_t)(PAD_PU | PAD_PD | PAD_OUTPUT_DISABLE | PAD_ISO);
+    GPIO_PAD(FAULT_UART_RX_GPIO) = (GPIO_PAD(FAULT_UART_RX_GPIO) | PAD_INPUT) & ~(uint32_t)(PAD_PU | PAD_PD | PAD_OUTPUT_DISABLE | PAD_ISO);
+
+    // Same divisor computation as the plugin, against the same runtime clock
+    // reading - if this dump is also garbled, the clock assumption itself is
+    // suspect, not just the plugin's own init sequence.
+    uint32_t clk_peri_hz = (uint32_t)RUNTIME->sysclk_mhz * 1000000u;
+    uint64_t scaled = ((uint64_t)clk_peri_hz * 4u + (FAULT_UART_BAUD / 2u)) / FAULT_UART_BAUD;
+    uint32_t ibrd = (uint32_t)(scaled >> 6);
+    uint32_t fbrd = (uint32_t)(scaled & 0x3Fu);
+    if (ibrd == 0u) {
+        ibrd = 1u;
+        fbrd = 0u;
+    }
+
+    UART_REG(FAULT_UART_BASE, UART_CR_OFFSET) = 0;
+    UART_REG(FAULT_UART_BASE, UART_IBRD_OFFSET) = ibrd;
+    UART_REG(FAULT_UART_BASE, UART_FBRD_OFFSET) = fbrd;
+    UART_REG(FAULT_UART_BASE, UART_LCR_H_OFFSET) = UART_LCR_H_WLEN_8 | UART_LCR_H_FEN;
+    UART_REG(FAULT_UART_BASE, UART_CR_OFFSET) = UART_CR_UARTEN | UART_CR_TXE | UART_CR_RXE;
+}
+
+// tag identifies which handler is dumping (H/B/U), e.g.
+// "\r\nFAULT[H] PC=10020184 R4=... R5=20081c00 ... R11=... CFSR=00000082 HFSR=40000000 MMFAR=00000000 BFAR=00000000\r\n"
+// pc is the stacked return address (0 if the caller has none, e.g. Bus/Usage
+// Fault which aren't captured via the naked/stacked-frame trampoline HardFault
+// uses) - for a precise fault (BFSR/MMFSR PRECISERR/IACCVIOL/DACCVIOL) this is
+// the exact faulting instruction, directly matchable against a .dis listing.
+// saved is NULL when the caller has no callee-saved snapshot (Bus/Usage
+// Fault, which aren't captured via the naked/stacked-frame trampoline
+// HardFault uses).
+static void fault_uart_dump(char tag, uint32_t pc, const callee_saved_t *saved, uint32_t cfsr, uint32_t hfsr, uint32_t mmfar, uint32_t bfar) {
+    fault_uart_init();
+    fault_uart_puts("\r\nFAULT[");
+    fault_uart_putc((uint8_t)tag);
+    fault_uart_puts("] PC=");
+    fault_uart_put_hex32(pc);
+    if (saved != NULL) {
+        fault_uart_puts(" R4=");  fault_uart_put_hex32(saved->r4);
+        fault_uart_puts(" R5=");  fault_uart_put_hex32(saved->r5);
+        fault_uart_puts(" R6=");  fault_uart_put_hex32(saved->r6);
+        fault_uart_puts(" R7=");  fault_uart_put_hex32(saved->r7);
+        fault_uart_puts(" R8=");  fault_uart_put_hex32(saved->r8);
+        fault_uart_puts(" R9=");  fault_uart_put_hex32(saved->r9);
+        fault_uart_puts(" R10="); fault_uart_put_hex32(saved->r10);
+        fault_uart_puts(" R11="); fault_uart_put_hex32(saved->r11);
+    }
+    fault_uart_puts(" CFSR=");
+    fault_uart_put_hex32(cfsr);
+    fault_uart_puts(" HFSR=");
+    fault_uart_put_hex32(hfsr);
+    fault_uart_puts(" MMFAR=");
+    fault_uart_put_hex32(mmfar);
+    fault_uart_puts(" BFAR=");
+    fault_uart_put_hex32(bfar);
+    fault_uart_puts("\r\n");
+}
 
 // Forward declarations
 void Reset_Handler(void);
@@ -172,6 +285,17 @@ void Reset_Handler(void) {
 
 // Default handler for unhandled interrupts - fast continuous blink
 void Default_Handler(void) {
+    // IPSR (readable directly, no naked/stacked-frame trampoline needed)
+    // gives the exact exception/IRQ number that landed here - this handler
+    // covers everything not individually named in the vector table, plus
+    // MemManage (aliased to it above), so knowing which one fired matters.
+    uint32_t ipsr;
+    __asm volatile ("mrs %0, ipsr" : "=r" (ipsr));
+    fault_uart_init();
+    fault_uart_puts("\r\nFAULT[D] IPSR=");
+    fault_uart_put_hex32(ipsr);
+    fault_uart_puts("\r\n");
+
     // Halt regardless of the status LED: an unhandled interrupt stays pending,
     // so returning from here just re-enters in a tight spin.  blink_pattern()
     // gates on status_led_enabled, so the LED only blinks when it is enabled.
@@ -202,22 +326,19 @@ typedef struct {
 } stacked_frame_t;
 
 // HardFault_Handler - double blink pattern
-void HardFault_C(stacked_frame_t *frame) {
-    (void)frame;
-
+void HardFault_C(stacked_frame_t *frame, callee_saved_t *saved) {
     // Fault status registers
     volatile uint32_t cfsr  = *(volatile uint32_t *)0xE000ED28; // MMFSR+BFSR+UFSR
     volatile uint32_t hfsr  = *(volatile uint32_t *)0xE000ED2C;
     volatile uint32_t mmfar = *(volatile uint32_t *)0xE000ED34; // Valid if CFSR.MMARVALID
     volatile uint32_t bfar  = *(volatile uint32_t *)0xE000ED38; // Valid if CFSR.BFARVALID
-    (void)cfsr;
-    (void)hfsr;
-    (void)mmfar;
-    (void)bfar;
 
     // Force the status LED on so the fault is visible even if it was off.
     RUNTIME->status_led_enabled = 1;
     setup_status_led();
+
+    fault_uart_dump('H', frame->pc, saved, cfsr, hfsr, mmfar, bfar);
+
     while(1) {
         blink_pattern(100000, 200000, 2);
         delay(1000000);
@@ -226,19 +347,32 @@ void HardFault_C(stacked_frame_t *frame) {
 
 void __attribute__((naked)) HardFault_Handler(void) {
     __asm volatile (
+        // Capture the original exception frame pointer (msp or psp) into r0
+        // *before* touching the stack ourselves, so the later push below -
+        // which always targets msp, since Handler mode never uses psp -
+        // cannot shift it out from under us.
         "tst   lr, #4\n"
         "ite   eq\n"
         "mrseq r0, msp\n"
         "mrsne r0, psp\n"
+        "push  {r4-r11}\n"
+        "mov   r1, sp\n"
         "b     HardFault_C\n"
     );
 }
 
 // BusFault_Handler - triple blink pattern
 void BusFault_Handler(void) {
+    volatile uint32_t cfsr  = *(volatile uint32_t *)0xE000ED28;
+    volatile uint32_t hfsr  = *(volatile uint32_t *)0xE000ED2C;
+    volatile uint32_t mmfar = *(volatile uint32_t *)0xE000ED34;
+    volatile uint32_t bfar  = *(volatile uint32_t *)0xE000ED38;
+
     // Force the status LED on so the fault is visible even if it was off.
     RUNTIME->status_led_enabled = 1;
     setup_status_led();
+
+    fault_uart_dump('B', 0, NULL, cfsr, hfsr, mmfar, bfar);
 
     while(1) {
         blink_pattern(100000, 200000, 3); // Triple blink
@@ -248,9 +382,16 @@ void BusFault_Handler(void) {
 
 // UsageFault_Handler - quadruple blink pattern
 void UsageFault_Handler(void) {
+    volatile uint32_t cfsr  = *(volatile uint32_t *)0xE000ED28;
+    volatile uint32_t hfsr  = *(volatile uint32_t *)0xE000ED2C;
+    volatile uint32_t mmfar = *(volatile uint32_t *)0xE000ED34;
+    volatile uint32_t bfar  = *(volatile uint32_t *)0xE000ED38;
+
     // Force the status LED on so the fault is visible even if it was off.
     RUNTIME->status_led_enabled = 1;
     setup_status_led();
+
+    fault_uart_dump('U', 0, NULL, cfsr, hfsr, mmfar, bfar);
 
     while(1) {
         blink_pattern(100000, 200000, 4); // Quadruple blink

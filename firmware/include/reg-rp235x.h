@@ -40,6 +40,8 @@
 #define PLL_SYS_BASE        0x40050000
 #define PLL_USB_BASE        0x40058000
 #define BUSCTRL_BASE        0x40068000
+#define UART0_BASE          0x40070000
+#define UART1_BASE          0x40078000
 #define ADC_BASE            0x400a0000
 #define TIMER0_BASE         0x400b0000
 #define XIP_CTRL_BASE       0x400c8000
@@ -77,6 +79,9 @@
 #define CLOCK_SYS_SELECTED      (*((volatile uint32_t *)(CLOCKS_BASE + 0x44)))
 #define CLOCK_ADC_CTRL          (*((volatile uint32_t *)(CLOCKS_BASE + 0x6C)))
 #define CLOCK_CLK_USB_CTRL      (*((volatile uint32_t *)(CLOCKS_BASE + 0x60)))
+#define CLOCK_PERI_CTRL         (*((volatile uint32_t *)(CLOCKS_BASE + 0x48)))
+// CLOCKS is shared chip-wide too - same atomic-alias rule as RESETS above.
+#define CLOCK_PERI_CTRL_SET     (*((volatile uint32_t *)(CLOCKS_BASE + 0x48 + 0x2000)))
 
 #define CLOCK_REF_SRC_XOSC      0x02
 #define CLOCK_REF_SRC_SEL_MASK  0b1111
@@ -91,6 +96,12 @@
 #define CLOCK_USB_CTRL_ENABLE     (1 << 11)
 #define CLOCK_USB_CTRL_AUXSRC_PLL_USB (0x0 << 5)
 
+// clk_peri has no glitchless SRC mux, only AUXSRC - CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLK_SYS
+// (0x0) is its reset value, so enabling with no further write already selects
+// clk_sys.  Its integer divider (CLOCKS_CLK_PERI_DIV, offset 0x4C) resets to
+// /1 and is left untouched.
+#define CLOCK_PERI_CTRL_ENABLE    (1 << 11)
+
 // PSM Registers
 #define PSM_FRCE_OFF        (*((volatile uint32_t *)(PSM_BASE + 0x004)))
 #define PSM_FRCE_OFF_SET    (*((volatile uint32_t *)(PSM_BASE + 0x004 + 0x2000)))
@@ -99,6 +110,12 @@
 
 // Reset registers
 #define RESET_RESET     (*((volatile uint32_t *)(RESETS_BASE + 0x00)))
+// RESETS is shared chip-wide (both cores, core firmware, any plugin) - use
+// the atomic SET/CLR aliases to change one bit, never a plain read-modify-
+// write on RESET_RESET, which can race with something else's concurrent
+// read-modify-write on the same register and clobber an unrelated bit.
+#define RESET_RESET_SET (*((volatile uint32_t *)(RESETS_BASE + 0x00 + 0x2000)))
+#define RESET_RESET_CLR (*((volatile uint32_t *)(RESETS_BASE + 0x00 + 0x3000)))
 #define RESET_WDSEL     (*((volatile uint32_t *)(RESETS_BASE + 0x04)))
 #define RESET_DONE      (*((volatile uint32_t *)(RESETS_BASE + 0x08)))
 
@@ -115,6 +132,8 @@
 #define RESET_SYSCFG        (1 << 20)
 #define RESET_SYSINFO       (1 << 21)
 #define RESET_TIMER0        (1 << 23)
+#define RESET_UART0         (1 << 26)
+#define RESET_UART1         (1 << 27)
 #define RESET_USBCTRL       (1 << 28)
 
 // GPIO registers
@@ -131,6 +150,7 @@
 #define GPIO_CTRL(pin)      (*(volatile uint32_t*)(IO_BANK0_BASE + GPIO_CTRL_OFFSET + pin*GPIO_SPACING))
 #define GPIO_READ(pin)      ((GPIO_STATUS(pin) >> GPIO_STATUS_INFROMPAD_BIT) & 1)
 
+#define GPIO_CTRL_FUNC_UART     0x02
 #define GPIO_CTRL_FUNC_SIO      0x05
 #define GPIO_CTRL_FUNC_PIO0     0x06
 #define GPIO_CTRL_FUNC_PIO1     0x07
@@ -186,6 +206,12 @@
 #define PAD_OUTPUT_DISABLE  (1 << PAD_OD_BIT)
 #define PAD_PU              (1 << PAD_PUE_BIT)
 #define PAD_PD              (1 << PAD_PDE_BIT)
+// Set at power-up to electrically isolate the pad from the chip's internal
+// logic (part of the glitch-free power-up sequence); software must clear it
+// once the pad's function select, pulls etc are configured, or the pad
+// never actually drives/senses the pin regardless of what the peripheral
+// behind it does.
+#define PAD_ISO             (1 << PAD_ISO_BIT)
 #define PAD_INPUT_PD        ((1 << PAD_PDE_BIT) | (1 << PAD_IE_BIT))
 #define PAD_INPUT_PU        ((1 << PAD_PUE_BIT) | (1 << PAD_IE_BIT))
 
@@ -257,6 +283,43 @@
 #define ADC_CS_START_ONCE   (1 << 2)
 #define ADC_CS_TS_EN        (1 << 1)
 #define ADC_CS_EN           (1 << 0)
+
+// UART Registers (PL011) - offsets are identical for UART0_BASE/UART1_BASE
+#define UART_DR_OFFSET       0x00
+#define UART_RSR_OFFSET      0x04  // read: receive status; write: error clear
+#define UART_FR_OFFSET       0x18
+#define UART_IBRD_OFFSET     0x24
+#define UART_FBRD_OFFSET     0x28
+#define UART_LCR_H_OFFSET    0x2C
+#define UART_CR_OFFSET       0x30
+
+#define UART_REG(base, off)  (*((volatile uint32_t *)((base) + (off))))
+
+#define UART_FR_RXFE_BIT     4
+#define UART_FR_TXFF_BIT     5
+#define UART_FR_RXFE         (1 << UART_FR_RXFE_BIT)
+#define UART_FR_TXFF         (1 << UART_FR_TXFF_BIT)
+
+#define UART_RSR_FE_BIT      0  // framing error
+#define UART_RSR_PE_BIT      1  // parity error
+#define UART_RSR_BE_BIT      2  // break error
+#define UART_RSR_OE_BIT      3  // overrun error
+#define UART_RSR_FE          (1 << UART_RSR_FE_BIT)
+#define UART_RSR_PE          (1 << UART_RSR_PE_BIT)
+#define UART_RSR_BE          (1 << UART_RSR_BE_BIT)
+#define UART_RSR_OE          (1 << UART_RSR_OE_BIT)
+
+#define UART_LCR_H_FEN_BIT   4
+#define UART_LCR_H_FEN       (1 << UART_LCR_H_FEN_BIT)
+#define UART_LCR_H_WLEN_LSB  5
+#define UART_LCR_H_WLEN_8    (0b11 << UART_LCR_H_WLEN_LSB)
+
+#define UART_CR_UARTEN_BIT   0
+#define UART_CR_TXE_BIT      8
+#define UART_CR_RXE_BIT      9
+#define UART_CR_UARTEN       (1 << UART_CR_UARTEN_BIT)
+#define UART_CR_TXE          (1 << UART_CR_TXE_BIT)
+#define UART_CR_RXE          (1 << UART_CR_RXE_BIT)
 
 // TIMER0 Registers
 #define TIMER0_TIMELR       (*((volatile uint32_t *)(TIMER0_BASE + 0x0C)))

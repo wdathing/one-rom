@@ -73,6 +73,9 @@ endif
 ifeq ($(DEBUG_LOGGING), 1)
 	CFLAGS += -DDEBUG_LOGGING=1
 endif
+ifeq ($(UART_BOOT_TEST), 1)
+	CFLAGS += -DUART_BOOT_TEST=1
+endif
 
 # Phony targets
 .PHONY: all clean clean-segger clean-apio-src segger segger-rtt apio size flash run

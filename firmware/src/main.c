@@ -5,6 +5,9 @@
 // MIT License
 
 #include "include.h"
+#ifdef UART_BOOT_TEST
+#include "reg-rp235x.h"
+#endif
 
 int firmware_main(void) {
     // Platform specific initialization
@@ -80,6 +83,49 @@ int firmware_main(void) {
     // Initialize clock
     DEBUG("Init clock");
     setup_clock();
+
+#ifdef UART_BOOT_TEST
+    // Bring-up test only: continuously transmit 0x55 on UART1 (GPIO40 TX /
+    // GPIO41 RX) from here - after clock setup, so RUNTIME->sysclk_mhz is
+    // valid, but before ROM serving (PIOs/DMA) or any plugin ever starts.
+    // Isolates UART1 bring-up completely from both.  Never returns.
+    {
+        CLOCK_PERI_CTRL = CLOCK_PERI_CTRL_ENABLE;
+
+        RESET_RESET_SET = RESET_UART1;
+        RESET_RESET_CLR = RESET_UART1;
+        while (!(RESET_DONE & RESET_UART1)) { }
+
+        GPIO_CTRL(40u) = GPIO_CTRL_FUNC_UART;
+        GPIO_CTRL(41u) = GPIO_CTRL_FUNC_UART;
+        // PAD_INPUT set on TX too, not just RX - confirmed against the SDK's
+        // own gpio_set_function(), which enables the pad input buffer
+        // unconditionally on every pin, output-only or not.
+        GPIO_PAD(40u) = (GPIO_PAD(40u) | PAD_INPUT) & ~(uint32_t)(PAD_PU | PAD_PD | PAD_OUTPUT_DISABLE | PAD_ISO);
+        GPIO_PAD(41u) = (GPIO_PAD(41u) | PAD_INPUT) & ~(uint32_t)(PAD_PU | PAD_PD | PAD_OUTPUT_DISABLE | PAD_ISO);
+
+        uint32_t clk_peri_hz = (uint32_t)RUNTIME->sysclk_mhz * 1000000u;
+        uint32_t baud = 115200u;
+        uint64_t scaled = ((uint64_t)clk_peri_hz * 4u + (baud / 2u)) / baud;
+        uint32_t ibrd = (uint32_t)(scaled >> 6);
+        uint32_t fbrd = (uint32_t)(scaled & 0x3Fu);
+        if (ibrd == 0u) {
+            ibrd = 1u;
+            fbrd = 0u;
+        }
+
+        UART_REG(UART1_BASE, UART_CR_OFFSET) = 0;
+        UART_REG(UART1_BASE, UART_IBRD_OFFSET) = ibrd;
+        UART_REG(UART1_BASE, UART_FBRD_OFFSET) = fbrd;
+        UART_REG(UART1_BASE, UART_LCR_H_OFFSET) = UART_LCR_H_WLEN_8 | UART_LCR_H_FEN;
+        UART_REG(UART1_BASE, UART_CR_OFFSET) = UART_CR_UARTEN | UART_CR_TXE | UART_CR_RXE;
+
+        for (;;) {
+            while (UART_REG(UART1_BASE, UART_FR_OFFSET) & UART_FR_TXFF) { }
+            UART_REG(UART1_BASE, UART_DR_OFFSET) = 0x55u;
+        }
+    }
+#endif // UART_BOOT_TEST
 
     // Set up the RAM table to serve the ROM from
     if (RUNTIME->current_rom_slot != NULL) {
