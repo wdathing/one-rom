@@ -225,10 +225,16 @@ static volatile uint32_t s_debug_heartbeat;
 // a byte that can only ever be '0' or '1', are otherwise indistinguishable
 // from a genuine mismatch).  session is which session this knock started -
 // same numbering as s_debug_session_count once the caller increments it.
-static volatile uint32_t s_debug_knock_session;
-static volatile uint8_t  s_debug_knock_match_write;
-static volatile uint8_t  s_debug_knock_match_read;
-static volatile uint8_t  s_debug_knock_window[KNOCK_LEN];
+//
+// TEMPORARILY REMOVED (2026-09) to free RAM budget for the checksum-error
+// investigation's own instrumentation - see s_debug_sticky_already's own
+// comment and the "~20-byte margin" note on init_data_bss() for why every
+// byte here is contested.  Re-add once that investigation no longer needs
+// the room: static volatile uint32_t s_debug_knock_session; static volatile
+// uint8_t s_debug_knock_match_write; static volatile uint8_t
+// s_debug_knock_match_read; static volatile uint8_t
+// s_debug_knock_window[KNOCK_LEN]; plus the write-site in
+// drivewire_wait_for_knock() (removed alongside, same reason).
 
 // Bring-up diagnostic only: the byte count of the most recently *completed*
 // write or read session (s_debug_main_phase says which kind), read back via
@@ -252,6 +258,65 @@ static volatile uint16_t s_debug_current_count;
 // over the ROM bus; not matching means the bug is upstream, in what UART1
 // actually received.
 static volatile uint16_t s_debug_received_checksum;
+
+// Bring-up diagnostic only: a "sticky" copy of s_debug_received_checksum
+// (plus which session it belongs to), latched only when count==256 - the
+// sector-read case this investigation cares about.  s_debug_received_checksum
+// itself gets overwritten by *any* read session, including the small 1-byte
+// "get error code" read HREAD issues immediately after a checksum mismatch -
+// by the time a peek lands, that follow-up (or the next thing after it) has
+// usually already clobbered the value this needs to see.  This survives
+// exactly those follow-up exchanges, so a peek only has to beat the *next*
+// 256-byte read, not the next read of any size - a far more generous window.
+static volatile uint16_t s_debug_sticky_received_checksum;
+static volatile uint32_t s_debug_sticky_session;
+
+// Bring-up diagnostic only: how many bytes were already sitting in
+// s_read_buf from drivewire_next_addr()'s opportunistic pre-drain at the
+// moment this session's own top-off loop is about to run - i.e. "already"
+// itself, latched before that (blocking) drivewire_uart_getc() loop can run.
+// Sticky and count==256-gated for the same reason as the checksum above:
+// distinguishes a shortfall that already exists before topping off even
+// starts (implicating UART1 reception or the pre-drain itself) from one that
+// only appears after topping off completes without blocking (implicating
+// something in how the completed buffer gets summed or relayed instead).
+static volatile uint16_t s_debug_sticky_already;
+
+// Bring-up diagnostic only: UART1's own receive-status flags (RSR - framing/
+// parity/break/overrun, see UART_RSR_OE and friends in reg-rp235x.h), snapshot
+// right after this session's own drain finishes, latched alongside the sticky
+// checksum above (same count==256 gate, same reasoning for why it needs to be
+// sticky).  RSR is cumulative and sticky in the hardware too - cleared once at
+// the top of the main loop, before this session's knock-wait even starts (see
+// that clear's own comment) - so a non-zero value here means UART1 flagged at
+// least one of these errors somewhere between this session's knock and the
+// end of its drain.  drivewire_uart_getc() and the opportunistic drain in
+// drivewire_next_addr() both discard the PL011's per-byte error bits by
+// casting UART_DR straight to uint8_t, so this is currently the only way to
+// see that anything went wrong at the UART hardware level at all - a missing
+// byte with no corresponding flag here means the loss did not happen there.
+static volatile uint32_t s_debug_sticky_rsr;
+
+// Bring-up diagnostic only, the write-session counterpart to
+// s_debug_received_checksum above: what drivewire_do_write() actually
+// forwarded to UART1 TX, captured as the ROM-bus relay puts each byte on the
+// wire (not what the CoCo intended to send, which this side has no
+// independent way to know) - same running-sum algorithm as
+// drivewire_checksum() on the FujiNet side and dwoneread.asm's DWRCODE, so it
+// is directly comparable against whatever the server reports back for a
+// write it complains about (e.g. the 2-byte read-checksum echo in HREAD).
+// The raw bytes matter as much as the sum here: a small write (the common
+// case - an opcode+subcommand, or that same 2-byte echo) can be read back
+// verbatim instead of just its sum, which pins down a single corrupted byte
+// exactly rather than merely detecting that the sum is off.  Fixed-size and
+// deliberately small: a longer write (e.g. OPEN_DIRECTORY's 259 bytes) only
+// has its first few bytes captured, which is exactly as informative for
+// spotting *whether* the relay corrupts something as capturing all of it
+// would be - the open question here is root cause, not a full byte dump.
+#define DEBUG_WRITE_BYTES 8u
+static volatile uint8_t  s_debug_write_bytes[DEBUG_WRITE_BYTES];
+static volatile uint16_t s_debug_write_byte_count;
+static volatile uint16_t s_debug_write_checksum;
 
 // ---------------------------------------------------------------------------
 // UART1
@@ -495,18 +560,6 @@ static session_dir_t drivewire_wait_for_knock(void) {
             if (window[i] != s_knock_write[i]) match_write = false;
             if (window[i] != s_knock_read[i])  match_read = false;
         }
-        if (match_write || match_read) {
-            // Bring-up diagnostic only - see s_debug_knock_session's comment.
-            // Stored in SRAM for `onerom inspect peek memory` rather than
-            // transmitted as UART text, which needs error-prone manual
-            // transcription off a scope in this setup.
-            s_debug_knock_session     = s_debug_session_count + 1u;
-            s_debug_knock_match_write = match_write ? 1u : 0u;
-            s_debug_knock_match_read  = match_read  ? 1u : 0u;
-            for (unsigned i = 0; i < KNOCK_LEN; i++) {
-                s_debug_knock_window[i] = window[i];
-            }
-        }
         if (match_write) {
             // Acknowledge as fast as possible - dwonewrite.asm's DWWrite
             // polls DW_KNOCK_ACK_ADDR for this exact value, with a timeout
@@ -553,10 +606,17 @@ static uint32_t drivewire_next_addr_skip_ack(void) {
 // ---------------------------------------------------------------------------
 
 static void drivewire_do_write(uint16_t count) {
+    uint16_t checksum = 0;
     for (uint16_t i = 0; i < count; i++) {
         uint8_t b = (uint8_t)(drivewire_next_addr() & 0xFFu);
+        if (i < DEBUG_WRITE_BYTES) {
+            s_debug_write_bytes[i] = b;
+        }
+        checksum = (uint16_t)(checksum + b);
         drivewire_uart_putc(b);
     }
+    s_debug_write_byte_count = (count < DEBUG_WRITE_BYTES) ? count : DEBUG_WRITE_BYTES;
+    s_debug_write_checksum   = checksum;
 
     // Restore the real ROM content at the ack address now the session is
     // over - drivewire_wait_for_knock() reprogrammed it to ack this
@@ -575,10 +635,20 @@ static void drivewire_do_read(uint16_t count) {
     // (drivewire_uart_getc() is a handful of cycles), so this drains far
     // faster than bytes can arrive even at 921600 baud.
     uint16_t already = (s_read_buf_filled < count) ? s_read_buf_filled : count;
+    // Bring-up diagnostic only - see s_debug_sticky_already's own comment.
+    // Latched here, before the topping-off loop below (which blocks) can run.
+    if (count == 256u) {
+        s_debug_sticky_already = already;
+    }
     for (uint16_t i = already; i < count; i++) {
         s_read_buf[i] = drivewire_uart_getc();
     }
     s_read_buf_filled = 0;
+
+    // Bring-up diagnostic only - see s_debug_sticky_rsr's own comment.  Read
+    // right after the drain above finishes, before anything else touches
+    // UART1, so this reflects only this session's own reception.
+    uint32_t rsr = UART_REG(DW_UART_BASE, UART_RSR_OFFSET);
 
     // Bring-up diagnostic only - see s_debug_received_checksum's own comment.
     uint16_t checksum = 0;
@@ -586,6 +656,11 @@ static void drivewire_do_read(uint16_t count) {
         checksum = (uint16_t)(checksum + s_read_buf[i]);
     }
     s_debug_received_checksum = checksum;
+    if (count == 256u) {
+        s_debug_sticky_received_checksum = checksum;
+        s_debug_sticky_rsr               = rsr;
+        s_debug_sticky_session            = s_debug_session_count;
+    }
 
     for (uint16_t i = 0; i < count; i++) {
         uint8_t b = s_read_buf[i];
@@ -923,6 +998,16 @@ void drivewire_main(
 #else
     for (;;) {
         s_debug_main_phase = 0u;
+        // Clear UART1's sticky receive-status flags (framing/parity/break/
+        // overrun - see UART_RSR_OE's own comment on s_debug_sticky_rsr)
+        // before this session's own knock-wait even starts, since the
+        // opportunistic UART drain in drivewire_next_addr() can already be
+        // pulling bytes for this session during knock-matching, before
+        // drivewire_do_read() is ever called - see its own comment.  A write
+        // is cleared identically here even though it doesn't drain UART1 RX,
+        // since gating this on which direction gets matched would need
+        // doing it twice; clearing unconditionally costs nothing.
+        UART_REG(DW_UART_BASE, UART_RSR_OFFSET) = 0;
         session_dir_t dir = drivewire_wait_for_knock();
         s_debug_session_count++;
 
