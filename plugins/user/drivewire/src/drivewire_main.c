@@ -15,12 +15,17 @@
 // how the CPU "sneaks" data out over a bus it can otherwise only read from.
 // Two knock sequences pick the session direction (no RBCP-style group/cmd
 // byte is needed, since the direction is the only thing to select), followed
-// by a single count byte (0 means 256, both directions):
+// by a 16-bit count N, high byte first (both directions) - matching the
+// 0-65535 range dw.h's dwwrite()/dwread() are themselves typed for, so a
+// caller can never ask this transport for more than it can carry:
 //
 //   write session (CoCo -> server): knock, count N, then N further
-//   address-encoded reads, forwarded byte for byte to UART1 TX.
+//   address-encoded reads, forwarded byte for byte to UART1 TX.  Streamed
+//   with no buffering, so N's full 16-bit range is always safe here.
 //
-//   read session (server -> CoCo): knock, count N.  For each of the N bytes,
+//   read session (server -> CoCo): knock, count N, capped in practice at
+//   sizeof(s_read_buf) - see the main loop's own comment on why a larger N
+//   is refused rather than served.  For each of the N bytes,
 //   the plugin blocks on UART1 RX, writes the byte to a fixed logical "data"
 //   address, then flips a fixed logical "status" address to a ready sentinel.
 //   The CoCo spin-reads status until ready, then reads data to collect the
@@ -156,6 +161,19 @@ static const uint8_t s_knock_read[KNOCK_LEN]  = "!DWRECV!";  // server -> CoCo
 #ifndef DW_UART_BAUD
 #define DW_UART_BAUD     921600u
 #endif
+
+// Bound on how long drivewire_uart_getc() will wait for a single RX byte -
+// see its own comment for why an unbounded wait here can wedge core 1
+// permanently.  A fixed iteration count, not derived from s_get_sysclk_mhz():
+// getting this exactly right would need scaling by clock speed to keep the
+// wall-clock duration constant, but the two failure modes are wildly
+// asymmetric - too long merely delays recovery from a genuine non-response,
+// while too short risks a spurious abort on a slow-but-working one (e.g.
+// FujiNet's SD card access taking a while under wear-levelling GC).  Sized
+// generously - tens of millions of iterations, comfortably multiple seconds
+// even on an overclocked RP2350 - so it only ever fires when nothing is
+// coming rather than shaving margin off any legitimately slow response.
+#define DW_UART_GETC_TIMEOUT 300000000ul
 
 typedef enum {
     SESSION_WRITE,
@@ -435,9 +453,18 @@ static void drivewire_uart_putc(uint8_t b) {
 }
 
 #ifndef DRIVEWIRE_TEST_PATTERN
-static uint8_t drivewire_uart_getc(void) {
-    while (UART_REG(DW_UART_BASE, UART_FR_OFFSET) & UART_FR_RXFE) { }
-    return (uint8_t)UART_REG(DW_UART_BASE, UART_DR_OFFSET);
+// Returns false on timeout (see DW_UART_GETC_TIMEOUT) without touching *out -
+// the caller must treat a false return as "no byte", not as byte 0x00, since
+// every value 0-255 is a valid received byte and cannot itself signal timeout.
+static bool drivewire_uart_getc(uint8_t *out) {
+    uint32_t timeout = DW_UART_GETC_TIMEOUT;
+    while (UART_REG(DW_UART_BASE, UART_FR_OFFSET) & UART_FR_RXFE) {
+        if (--timeout == 0u) {
+            return false;
+        }
+    }
+    *out = (uint8_t)UART_REG(DW_UART_BASE, UART_DR_OFFSET);
+    return true;
 }
 #endif
 
@@ -641,7 +668,21 @@ static void drivewire_do_read(uint16_t count) {
         s_debug_sticky_already = already;
     }
     for (uint16_t i = already; i < count; i++) {
-        s_read_buf[i] = drivewire_uart_getc();
+        if (!drivewire_uart_getc(&s_read_buf[i])) {
+            // Timed out: FujiNet never sent the rest of this response - most
+            // plausibly because an earlier, corrupted write left it still
+            // blocked reading a request that will never complete (see
+            // DW_UART_GETC_TIMEOUT's own comment).  Bail out to the next
+            // knock rather than wedging core 1 here forever: safe to do with
+            // no cleanup, since DW_STATUS_ADDR/DW_DATA_ADDR are still exactly
+            // as the previous session's own cleanup left them - this session
+            // has not touched either yet.  s_read_buf_filled is reset so a
+            // partially-filled buffer from this abort cannot be mistaken for
+            // a genuine pre-drain by whatever session starts next.
+            s_read_buf_filled = 0;
+            s_err_log("DriveWire: timed out waiting for UART1 RX, aborting session");
+            return;
+        }
     }
     s_read_buf_filled = 0;
 
@@ -1012,18 +1053,38 @@ void drivewire_main(
         s_debug_session_count++;
 
         s_debug_main_phase = 1u;
-        uint32_t raw_count = drivewire_next_addr_skip_ack() & 0xFFu;
-        uint16_t count = (raw_count == 0u) ? 256u : (uint16_t)raw_count;
+        // 16-bit count, high byte first - matches dwonewrite.asm's/
+        // dwoneread.asm's identical encoding (see either's own comment).
+        // No more 0-means-256 special case: 16 bits already covers the
+        // dw.h-documented 0-65535 range directly.
+        uint32_t count_hi = drivewire_next_addr_skip_ack() & 0xFFu;
+        uint32_t count_lo = drivewire_next_addr_skip_ack() & 0xFFu;
+        uint16_t count = (uint16_t)((count_hi << 8) | count_lo);
         s_debug_current_count = count;
 
         if (dir == SESSION_WRITE) {
+            // No buffer here - drivewire_do_write() streams the ROM bus
+            // straight to UART1 one byte at a time, so any count up to
+            // 65535 is safe.
             s_debug_main_phase = 2u;
             drivewire_do_write(count);
             s_debug_last_count = count;
-        } else {
+        } else if (count <= sizeof(s_read_buf)) {
             s_debug_main_phase = 3u;
             drivewire_do_read(count);
             s_debug_last_count = count;
+        } else {
+            // Unlike writes, drivewire_do_read() buffers the whole response
+            // in s_read_buf before relaying it (see its own comment on the
+            // opportunistic pre-drain), and that buffer is a fixed
+            // sizeof(s_read_buf) bytes - RAM tight enough elsewhere in this
+            // plugin that it cannot simply be grown to match the wire
+            // format's new 65535-byte ceiling.  Nothing today asks for a
+            // read this large, but the wire format now allows a future bug
+            // (or a not-yet-written FUJICMD) to request one, so refuse it
+            // outright rather than overrunning s_read_buf into whatever
+            // static RAM happens to sit right after it.
+            s_err_log("DriveWire: read count %u exceeds buffer, ignoring session", count);
         }
     }
 #endif
