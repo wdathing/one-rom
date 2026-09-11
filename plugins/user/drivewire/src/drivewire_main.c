@@ -120,6 +120,11 @@ static uint32_t            s_read_idx;
 static const uint8_t s_knock_write[KNOCK_LEN] = "!DWSEND!";  // CoCo -> server
 #ifndef DRIVEWIRE_TEST_PATTERN
 static const uint8_t s_knock_read[KNOCK_LEN]  = "!DWRECV!";  // server -> CoCo
+// CoCo -> plugin: load and activate a cartridge/ROM image - see
+// drivewire_do_load_cart()'s own comment for the full protocol.  Not part of
+// DriveWire proper - a One-ROM-specific extension the config app's own
+// knock-sending code (not fujinet-lib, not hdbdos) speaks directly.
+static const uint8_t s_knock_cart[KNOCK_LEN]  = "!LDCART!";
 #endif
 
 // ---------------------------------------------------------------------------
@@ -137,11 +142,13 @@ static const uint8_t s_knock_read[KNOCK_LEN]  = "!DWRECV!";  // server -> CoCo
 
 // A third live ROM byte, deliberately in a different 256-byte page from
 // DW_STATUS_ADDR/DW_DATA_ADDR above.  Written to DW_KNOCK_ACK_VALUE the
-// instant a write-session knock matches (see drivewire_wait_for_knock()), so
-// the CoCo's own bounded poll-and-retry in dwonewrite.asm's DWWrite can tell
-// its knock actually landed and resend if it doesn't see this in time - only
-// write knocks get this treatment, since the read direction's own knock has
-// never been observed to go missing, unlike the write knock this guards.
+// instant a write-session or "!LDCART!" knock matches (see
+// drivewire_wait_for_knock()), so the CoCo's own bounded poll-and-retry -
+// dwonewrite.asm's DWWrite, or a "!LDCART!" caller doing the same thing -
+// can tell its knock actually landed and resend, or give up gracefully, if
+// it doesn't see this in time.  The read direction's own knock does not get
+// this treatment: it has never been observed to go missing, unlike the
+// write knock this guards.
 //
 // This cannot reuse DW_STATUS_ADDR/DW_DATA_ADDR themselves: the count and
 // data bytes that follow a knock are sent the same way the knock is - as an
@@ -178,7 +185,16 @@ static const uint8_t s_knock_read[KNOCK_LEN]  = "!DWRECV!";  // server -> CoCo
 typedef enum {
     SESSION_WRITE,
     SESSION_READ,
+    SESSION_LOAD_CART,
 } session_dir_t;
+
+// Dedicated RAM slot "!LDCART!" loads a cartridge image into - deliberately
+// never the currently-active slot (slot 0, hdbonerom.rom in this plugin's
+// own build), so the transfer can never corrupt what the CoCo might still
+// be executing from, and drivewire_do_load_cart() only ever needs
+// allow_active=0 when reprogramming it.  See that function's own comment
+// for the full handshake.
+#define DW_CART_RAM_SLOT 1u
 
 // ---------------------------------------------------------------------------
 // Looked-up API functions
@@ -190,6 +206,8 @@ static ora_demangle_addr_fn_t               s_demangle;
 static ora_reprogram_ram_rom_slot_fn_t      s_reprogram;
 static ora_read_ram_rom_slot_fn_t           s_read_slot;
 static ora_get_active_ram_slot_fn_t         s_get_active_slot;
+static ora_set_active_ram_slot_fn_t         s_set_active_slot;
+static ora_get_ram_slot_info_fn_t           s_get_ram_slot_info;
 static ora_get_sysclk_mhz_fn_t              s_get_sysclk_mhz;
 static ora_start_address_monitor_fn_t       s_start_monitor;
 static ora_get_address_monitor_ring_write_pos_fn_t s_get_write_pos;
@@ -221,11 +239,14 @@ static uint16_t s_read_buf_filled;
 // variables above - these cover write sessions and knock-waiting too, so a
 // stall outside drivewire_do_read() entirely (e.g. waiting for whatever
 // knock is supposed to follow a just-completed session) is still visible.
-// phase: 0=waiting for knock, 1=reading the count byte, 2=in a write
-// session, 3=in a read session.  session_count increments once per detected
-// knock (so once per write or read session - a full sector "block" is
-// several of these: the request, the 256-byte data, the 2-byte checksum,
-// and the 1-byte ack, each a separate session).
+// phase: 0=waiting for knock, 1=reading the count bytes, 2=in a write
+// session, 3=in a read session, 4=in a "!LDCART!" load, 5=a "!LDCART!" load
+// succeeded and this plugin has permanently stopped monitoring the ROM bus
+// (see drivewire_do_load_cart()'s own comment) - the terminal phase, since
+// nothing after it changes this again short of a power cycle.  session_count
+// increments once per detected knock (so once per session of any kind - a
+// full sector "block" is several of these: the request, the 256-byte data,
+// the 2-byte checksum, and the 1-byte ack, each a separate session).
 static volatile uint8_t  s_debug_main_phase;
 static volatile uint32_t s_debug_session_count;
 // Increments on every single call to drivewire_next_addr(), the most
@@ -367,6 +388,16 @@ static void drivewire_uart_init(void) {
     // never has to think about this ordering because its own boot sequence
     // already has clk_peri running long before any call to uart_init().
     CLOCK_PERI_CTRL = CLOCK_PERI_CTRL_ENABLE;
+
+    // Settle: the enable above has to actually propagate and clk_peri start
+    // toggling before the RESET_DONE wait below (which synchronises through
+    // that same clock domain) can ever see it complete - see this function's
+    // own comment above. That propagation is a fixed, small number of clk_sys
+    // cycles, not something that scales with clk_sys itself, so it went
+    // unnoticed at this plugin's stock 150MHz (the intervening code executed
+    // slowly enough to clear it by accident) and only surfaced as a hang here
+    // once cpu-freq raised clk_sys - confirmed on real hardware at 200MHz.
+    for (volatile int i = 0; i < 100; i++) { }
 
     // Force UART1 through a full reset cycle rather than just clearing the
     // reset bit and assuming it was already set.  That assumption only holds
@@ -582,24 +613,28 @@ static session_dir_t drivewire_wait_for_knock(void) {
         }
         window[KNOCK_LEN - 1u] = b;
 
-        bool match_write = true, match_read = true;
+        bool match_write = true, match_read = true, match_cart = true;
         for (unsigned i = 0; i < KNOCK_LEN; i++) {
             if (window[i] != s_knock_write[i]) match_write = false;
             if (window[i] != s_knock_read[i])  match_read = false;
+            if (window[i] != s_knock_cart[i])  match_cart = false;
         }
-        if (match_write) {
-            // Acknowledge as fast as possible - dwonewrite.asm's DWWrite
-            // polls DW_KNOCK_ACK_ADDR for this exact value, with a timeout
-            // that resends the whole knock if it never sees it (see
-            // DW_KNOCK_ACK_ADDR's own comment).  drivewire_do_write()
-            // restores the real ROM content here once the session ends,
-            // matching how drivewire_do_read() already restores both
-            // channel addresses at the end of a read session.
+        if (match_write || match_cart) {
+            // Acknowledge as fast as possible - dwonewrite.asm's DWWrite,
+            // and a "!LDCART!" caller doing the same thing, poll
+            // DW_KNOCK_ACK_ADDR for this exact value, with a timeout that
+            // resends the whole knock if it never sees it (see
+            // DW_KNOCK_ACK_ADDR's own comment).  drivewire_do_write()/
+            // drivewire_do_load_cart() each restore the real ROM content
+            // here once their own session ends, matching how
+            // drivewire_do_read() already restores both channel addresses
+            // at the end of a read session.
             uint8_t ack = DW_KNOCK_ACK_VALUE;
             s_reprogram(s_active_slot, DW_KNOCK_ACK_ADDR, &ack, 1u, 1u);
-            return SESSION_WRITE;
         }
+        if (match_write) return SESSION_WRITE;
         if (match_read)  return SESSION_READ;
+        if (match_cart)  return SESSION_LOAD_CART;
     }
 }
 #endif // !DRIVEWIRE_TEST_PATTERN
@@ -739,6 +774,302 @@ static void drivewire_do_read(uint16_t count) {
     s_reprogram(s_active_slot, DW_STATUS_ADDR, &s_orig_status_byte, 1u, 1u);
     s_reprogram(s_active_slot, DW_DATA_ADDR, &s_orig_data_byte, 1u, 1u);
 }
+
+// ---------------------------------------------------------------------------
+// DBC (FujiBusPacket) - "!LDCART!" only
+// ---------------------------------------------------------------------------
+//
+// A "!LDCART!" knock doesn't stream the cartridge image off the ROM bus
+// itself (the CoCo has nothing left to do but poll for the completion ack -
+// see drivewire_do_load_cart()'s own comment).  Instead, this plugin asks the
+// FujiNet ESP32 - over UART1, same wire as ordinary DriveWire traffic - to
+// push device slot 0's already-mounted ROM image directly, using the same
+// SLIP-framed "DBC" side channel FujiNet's `fujiversal`/`COCO_HS_UART`
+// firmware already speaks to a pico-class companion elsewhere (see
+// lib/media/drivewire/mediaTypeROM.cpp's push_stream() and
+// lib/bus/rs232/FujiBusPacket.cpp in that tree for the authoritative wire
+// format this mirrors).  The request that triggers the push
+// (OP_FUJI/FUJI_PULL_ROM below) is a plain, unframed DriveWire opcode - SLIP
+// framing is only ever used for the DBC exchange that follows it, never for
+// this plugin's own request.
+//
+// This works with zero opportunistic-drain interference from
+// drivewire_next_addr() (which siphons UART1 bytes into s_read_buf on every
+// call, for the unrelated ordinary-read-session pre-fetch): this whole
+// exchange runs from inside drivewire_do_load_cart(), which never calls
+// drivewire_next_addr() at all, only drivewire_uart_getc()/drivewire_uart_putc()
+// directly.  Nothing else is using UART1 at this point - the CoCo is just
+// spin-polling DW_KNOCK_ACK_ADDR - so there is no live DriveWire transaction
+// for these frames to arrive in the middle of, unlike the mid-mailbox-
+// transaction case FujiNet's own Intellivision port has to handle.
+#define DBC_SLIP_END       0xC0u
+#define DBC_SLIP_ESC       0xDBu
+#define DBC_SLIP_ESC_END   0xDCu
+#define DBC_SLIP_ESC_ESC   0xDDu
+
+#define DBC_FUJI_DEVICEID  0xFFu
+#define DBC_CMD_NET_OPEN   0x4Fu
+#define DBC_CMD_NET_WRITE  0x57u
+#define DBC_CMD_NET_CLOSE  0x43u
+#define DBC_CMD_FUJI_ACK   0x06u
+#define DBC_CMD_FUJI_NAK   0x15u
+
+#define DBC_HEADER_LEN     6u   // device, command, length(lo,hi), checksum, descr
+
+#define FUJI_OP_FUJI       0xE2u  // matches dw.h's OP_FUJI - see fuji_mount_host_slot.c
+#define FUJI_CMD_PULL_ROM  0xECu  // matches centi-fuji's CMD::FUJI_PULL_ROM
+
+// Folds one more byte into a running checksum - matches FujiBusPacket's
+// calcChecksum() exactly (an 8-bit add-with-end-around-carry), which stays a
+// clean 0-255 value after every call since the largest possible pre-fold sum
+// is 255+255.
+static uint8_t dbc_checksum_add(uint8_t chk, uint8_t b) {
+    uint16_t sum = (uint16_t)chk + b;
+    return (uint8_t)((sum >> 8) + (sum & 0xFFu));
+}
+
+// Sends one bare (no params, no payload) SLIP-framed DBC header - only ever
+// used here for our own ACK/NAK replies, mirroring FujiNet's own
+// dbc_send_frame() in the Intellivision port's fujinet.c.
+static void dbc_send_frame(uint8_t command) {
+    uint8_t header[DBC_HEADER_LEN];
+    header[0] = DBC_FUJI_DEVICEID;
+    header[1] = command;
+    header[2] = DBC_HEADER_LEN;   // length, low byte
+    header[3] = 0u;               // length, high byte
+    header[4] = 0u;               // checksum - filled in below
+    header[5] = 0u;               // descr - no packed params, ever, on this link
+
+    uint8_t chk = 0u;
+    for (unsigned i = 0; i < DBC_HEADER_LEN; i++) {
+        chk = dbc_checksum_add(chk, header[i]);
+    }
+    header[4] = chk;
+
+    drivewire_uart_putc(DBC_SLIP_END);
+    for (unsigned i = 0; i < DBC_HEADER_LEN; i++) {
+        uint8_t b = header[i];
+        if (b == DBC_SLIP_END) {
+            drivewire_uart_putc(DBC_SLIP_ESC);
+            drivewire_uart_putc(DBC_SLIP_ESC_END);
+        } else if (b == DBC_SLIP_ESC) {
+            drivewire_uart_putc(DBC_SLIP_ESC);
+            drivewire_uart_putc(DBC_SLIP_ESC_ESC);
+        } else {
+            drivewire_uart_putc(b);
+        }
+    }
+    drivewire_uart_putc(DBC_SLIP_END);
+}
+
+// Reads and validates exactly one SLIP-framed DBC packet from UART1, timing
+// out (see drivewire_uart_getc()) rather than blocking forever if the ESP32
+// stops responding mid-exchange.  Any payload beyond the 6-byte header
+// streams directly into s_read_buf, reused here purely as scratch space -
+// nothing else needs it during a "!LDCART!" load, and it is already sized
+// to fit push_stream()'s own 256-byte (MEDIA_BLOCK_SIZE) NET_WRITE chunks
+// exactly.  This plugin never sends packed params of its own and FujiNet's
+// push_stream() never does either (its payloads always travel as a raw
+// FujiBusPacket _data blob, not as descriptor-packed params), so descr is
+// always 0 here and everything past the header is unconditionally payload -
+// no descriptor/param parsing to implement.
+static bool dbc_recv_frame(uint8_t *device, uint8_t *command, uint16_t *payload_len) {
+    enum { WAIT_START, IN_FRAME, IN_ESCAPE } state = WAIT_START;
+    uint8_t header[DBC_HEADER_LEN];
+    uint16_t decoded_len = 0;
+    uint8_t chk = 0;
+    bool frame_complete = false;
+
+    while (!frame_complete) {
+        uint8_t b;
+        if (!drivewire_uart_getc(&b)) {
+            return false;
+        }
+
+        bool have_byte = false;
+        uint8_t decoded_byte = 0;
+
+        switch (state) {
+        case WAIT_START:
+            if (b == DBC_SLIP_END) {
+                state = IN_FRAME;
+                decoded_len = 0;
+                chk = 0;
+            }
+            break;
+
+        case IN_ESCAPE:
+            state = IN_FRAME;
+            if (b == DBC_SLIP_ESC_END) { decoded_byte = DBC_SLIP_END; have_byte = true; }
+            else if (b == DBC_SLIP_ESC_ESC) { decoded_byte = DBC_SLIP_ESC; have_byte = true; }
+            // else: malformed escape - drop it, matching decodeSLIP()'s own leniency
+            break;
+
+        default:  // IN_FRAME
+            if (b == DBC_SLIP_END) {
+                if (decoded_len != 0) {
+                    frame_complete = true;
+                }
+                // else: this was just the frame's own opening marker
+            } else if (b == DBC_SLIP_ESC) {
+                state = IN_ESCAPE;
+            } else {
+                decoded_byte = b;
+                have_byte = true;
+            }
+            break;
+        }
+
+        if (have_byte) {
+            if (decoded_len < DBC_HEADER_LEN) {
+                header[decoded_len] = decoded_byte;
+                // The checksum field itself contributes 0, not its
+                // transmitted value - matching the sender zeroing it out
+                // before computing its own checksum.
+                chk = dbc_checksum_add(chk, decoded_len == 4u ? 0u : decoded_byte);
+            } else if ((decoded_len - DBC_HEADER_LEN) < sizeof(s_read_buf)) {
+                s_read_buf[decoded_len - DBC_HEADER_LEN] = decoded_byte;
+                chk = dbc_checksum_add(chk, decoded_byte);
+            }
+            // else: payload longer than s_read_buf can hold - should never
+            // happen (see this function's own comment); the length/checksum
+            // check below catches it rather than silently accepting a
+            // truncated payload.
+            decoded_len++;
+        }
+    }
+
+    if (decoded_len < DBC_HEADER_LEN) {
+        return false;
+    }
+    uint16_t claimed_len = (uint16_t)header[2] | ((uint16_t)header[3] << 8);
+    if (claimed_len != decoded_len || chk != header[4]) {
+        return false;
+    }
+
+    *device = header[0];
+    *command = header[1];
+    *payload_len = (uint16_t)(decoded_len - DBC_HEADER_LEN);
+    return true;
+}
+
+// Handles a "!LDCART!" session end to end: asks FujiNet to push device slot
+// 0's mounted ROM image via DBC straight into DW_CART_RAM_SLOT (never
+// s_active_slot - see that macro's own comment), then, if it all arrived and
+// fit, atomically switches to it.  Not part of DriveWire proper - a
+// One-ROM-specific extension the config app speaks directly (see
+// s_knock_cart's own comment) to transiently boot a user-chosen cartridge
+// image.  The caller is expected to jump to $C000 once it sees the
+// completion ack this sets, and neither side expects any further DriveWire
+// traffic afterwards - only a power cycle restores normal FujiNet operation,
+// so nothing here worries about leaving state behind for a later session.
+//
+// The completion ack deliberately goes through s_active_slot's own
+// DW_KNOCK_ACK_ADDR - still slot 0 at this point, still the byte this
+// plugin already owns and restores - and only *then* does the switch
+// happen.  It cannot instead be written into DW_CART_RAM_SLOT itself: that
+// slot's contents are an arbitrary user-chosen cartridge image whose layout
+// this plugin has no knowledge of, so writing a signalling byte anywhere
+// within it risks corrupting the very image just loaded.  The caller is
+// expected to pause briefly after seeing the ack before jumping, as cheap
+// insurance against the (already tiny, given the ~100x clock difference
+// between this CPU and a 6809) gap between this ack and the slot switch
+// actually completing.
+//
+// Returns true on success - at which point the caller MUST stop calling
+// drivewire_wait_for_knock()/drivewire_next_addr() (see drivewire_main()'s
+// own dispatch) rather than looping back to it.  Once the CoCo jumps to
+// $C000, every single instruction fetch is itself a ROM-bus read; the
+// cart's own code generates these at full CPU speed, nothing like a
+// DriveWire session's own deliberately paced trickle of knock/count/data
+// reads, and the knock-matching loop's ring buffer (and the address
+// monitor's own DMA/FIFO capture path, shared with ROM-serving - see commit
+// aa765b4) was never sized or prioritised for that load.  Confirmed on real
+// hardware: leaving this loop running after a successful load corrupts served
+// reads within the cart's own first ~150 instruction fetches and then wedges
+// the bus outright.  Returns false on failure (no One ROM present, timeout,
+// or the image didn't fit) - the caller keeps monitoring normally, since
+// nothing has been activated and slot 0 is still what is being served.
+static bool drivewire_do_load_cart(void) {
+    // Clear the knock-accept ack immediately, before it can be mistaken for
+    // the *completion* ack below - drivewire_wait_for_knock() just set it to
+    // signal "knock landed", and if it were left at DW_KNOCK_ACK_VALUE, the
+    // caller's completion poll would see "done" instantly, before this
+    // function has asked FujiNet for anything yet.
+    s_reprogram(s_active_slot, DW_KNOCK_ACK_ADDR, &s_orig_ack_byte, 1u, 1u);
+
+    // Fire-and-forget: FUJI_PULL_ROM gets no reply of its own on the wire
+    // (matching FUJICMD_MOUNT_HOST and friends - see fuji_get_error()'s own,
+    // separate follow-up query in fujinet-lib for how a real CoCo client
+    // would normally check).  The DBC exchange below is the actual point.
+    // Device slot 0 is the only slot the config app's file browser ever
+    // mounts a ROM/CCC image into.
+    drivewire_uart_putc(FUJI_OP_FUJI);
+    drivewire_uart_putc(FUJI_CMD_PULL_ROM);
+    drivewire_uart_putc(0u);
+
+    uint32_t slot_size = 0;
+    ora_result_t size_rc = s_get_ram_slot_info(DW_CART_RAM_SLOT, NULL, &slot_size, NULL);
+
+    bool ok = true;
+    uint32_t offset = 0;
+    for (;;) {
+        uint8_t device, command;
+        uint16_t payload_len;
+        if (!dbc_recv_frame(&device, &command, &payload_len) || device != DBC_FUJI_DEVICEID) {
+            s_err_log("DriveWire: !LDCART! DBC frame timed out or malformed");
+            ok = false;
+            break;
+        }
+
+        if (command == DBC_CMD_NET_OPEN) {
+            // Payload: stream id (unused - device slot 0 only ever pushes a
+            // single ROM stream), then the stream's total size as 4
+            // little-endian bytes - see push_stream()'s own comment.
+            uint32_t size = 0;
+            if (payload_len >= 5u) {
+                size = (uint32_t)s_read_buf[1] | ((uint32_t)s_read_buf[2] << 8) |
+                       ((uint32_t)s_read_buf[3] << 16) | ((uint32_t)s_read_buf[4] << 24);
+            }
+            offset = 0;
+            bool fits = (size_rc == ORA_RESULT_OK) && (size <= slot_size);
+            dbc_send_frame(fits ? DBC_CMD_FUJI_ACK : DBC_CMD_FUJI_NAK);
+            if (!fits) {
+                s_err_log("DriveWire: cartridge image (%lu bytes) does not fit slot %u",
+                          (unsigned long)size, (unsigned)DW_CART_RAM_SLOT);
+                ok = false;
+                break;
+            }
+        } else if (command == DBC_CMD_NET_WRITE) {
+            for (uint16_t i = 0; i < payload_len && offset < slot_size; i++, offset++) {
+                s_reprogram(DW_CART_RAM_SLOT, offset, &s_read_buf[i], 1u, 0u);
+            }
+            dbc_send_frame(DBC_CMD_FUJI_ACK);
+        } else if (command == DBC_CMD_NET_CLOSE) {
+            // Abort-CLOSE (payload 0x01): FujiNet gave up mid-stream - unwedge
+            // without booting partial data.  Bare CLOSE = a complete transfer.
+            bool aborted = (payload_len > 0u && s_read_buf[0] == 0x01u);
+            dbc_send_frame(DBC_CMD_FUJI_ACK);
+            ok = !aborted;
+            break;
+        } else {
+            dbc_send_frame(DBC_CMD_FUJI_NAK);
+        }
+    }
+
+    if (!ok) {
+        return false;  // No completion ack sent - the caller's own poll times
+                        // out exactly as it would for "no One ROM connected";
+                        // nothing has been activated, so slot 0 keeps serving
+                        // as before.
+    }
+
+    uint8_t ack = DW_KNOCK_ACK_VALUE;
+    s_reprogram(s_active_slot, DW_KNOCK_ACK_ADDR, &ack, 1u, 1u);
+
+    s_set_active_slot(DW_CART_RAM_SLOT);
+    return true;
+}
 #endif // !DRIVEWIRE_TEST_PATTERN
 
 // ---------------------------------------------------------------------------
@@ -752,6 +1083,8 @@ static void drivewire_setup(ora_lookup_fn_t ora_lookup_fn) {
     s_reprogram       = ora_lookup_fn(ORA_ID_REPROGRAM_RAM_ROM_SLOT);
     s_read_slot       = ora_lookup_fn(ORA_ID_READ_RAM_ROM_SLOT);
     s_get_active_slot = ora_lookup_fn(ORA_ID_GET_ACTIVE_RAM_SLOT);
+    s_set_active_slot = ora_lookup_fn(ORA_ID_SET_ACTIVE_RAM_SLOT);
+    s_get_ram_slot_info = ora_lookup_fn(ORA_ID_GET_RAM_SLOT_INFO);
     s_get_sysclk_mhz  = ora_lookup_fn(ORA_ID_GET_SYSCLK_MHZ);
     s_set_status_led  = ora_lookup_fn(ORA_ID_SET_STATUS_LED);
 
@@ -1051,6 +1384,30 @@ void drivewire_main(
         UART_REG(DW_UART_BASE, UART_RSR_OFFSET) = 0;
         session_dir_t dir = drivewire_wait_for_knock();
         s_debug_session_count++;
+
+        if (dir == SESSION_LOAD_CART) {
+            // Unlike a write/read session, "!LDCART!" carries no count or
+            // data of its own on the ROM bus at all - the whole exchange
+            // happens over UART1 instead, so there is nothing more to read
+            // off the address bus before dispatching.  See
+            // drivewire_do_load_cart()'s own comment.
+            s_debug_main_phase = 4u;
+            s_debug_current_count = 0u;
+            if (drivewire_do_load_cart()) {
+                // Success: the CoCo is about to jump into the freshly-loaded
+                // cart and run it at full speed.  Stop monitoring the ROM
+                // bus entirely from here on - see drivewire_do_load_cart()'s
+                // own comment on why continuing to do so corrupts/wedges the
+                // cart's own execution.  Only a power cycle recovers normal
+                // operation, matching every other comment on this knock.
+                s_debug_main_phase = 5u;
+                for (;;) {
+                    ORA_TEST_YIELD();
+                }
+            }
+            s_debug_last_count = 0u;
+            continue;
+        }
 
         s_debug_main_phase = 1u;
         // 16-bit count, high byte first - matches dwonewrite.asm's/
