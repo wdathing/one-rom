@@ -2,5 +2,8 @@
     "name": "drivewire",
     "display_name": "DriveWire Bridge",
     "description": "Bridges a CoCo/Dragon DriveWire session to a real DriveWire server over One ROM's RP2350 UART1",
+    "author": "Bill Athing",
+    "source": "https://github.com/wdathing/one-rom",
+    "license": "MIT",
     "build_output": "build/drivewire_plugin.bin"
 }
