@@ -60,6 +60,7 @@
 #define RP2350A
 #include "onerom_metadata.h"
 #include "reg-rp235x.h"
+#include "uart-rp235x.h"
 
 // ---------------------------------------------------------------------------
 // Plugin header
@@ -83,9 +84,10 @@ const ora_plugin_header_t ora_plugin_header = {
     .sam_usage     = 255,
     .overrides1    = 0,
     .properties1   = 0,  // does not support yielding - see file header comment
+    // 0.7.3 for ora_address_monitor_options_t - see drivewire_main().
     .min_fw_major_version = 0,
     .min_fw_minor_version = 7,
-    .min_fw_patch_version = 1,
+    .min_fw_patch_version = 3,
     .reserved = {0},
 };
 
@@ -117,14 +119,14 @@ static uint32_t            s_read_idx;
 // ---------------------------------------------------------------------------
 
 #define KNOCK_LEN 8u
-static const uint8_t s_knock_write[KNOCK_LEN] = "!DWSEND!";  // CoCo -> server
+static const uint8_t s_knock_write[KNOCK_LEN] = {'!','D','W','S','E','N','D','!'};  // "!DWSEND!" CoCo -> server
 #ifndef DRIVEWIRE_TEST_PATTERN
-static const uint8_t s_knock_read[KNOCK_LEN]  = "!DWRECV!";  // server -> CoCo
+static const uint8_t s_knock_read[KNOCK_LEN]  = {'!','D','W','R','E','C','V','!'};  // "!DWRECV!" server -> CoCo
 // CoCo -> plugin: load and activate a cartridge/ROM image - see
 // drivewire_do_load_cart()'s own comment for the full protocol.  Not part of
 // DriveWire proper - a One-ROM-specific extension the config app's own
 // knock-sending code (not fujinet-lib, not hdbdos) speaks directly.
-static const uint8_t s_knock_cart[KNOCK_LEN]  = "!LDCART!";
+static const uint8_t s_knock_cart[KNOCK_LEN]  = {'!','L','D','C','A','R','T','!'};  // "!LDCART!"
 #endif
 
 // ---------------------------------------------------------------------------
@@ -1111,13 +1113,22 @@ static void drivewire_setup(ora_lookup_fn_t ora_lookup_fn) {
     // regardless of call order. Trimming that instrumentation (see the
     // deleted per-byte read-session debug vars) reopened a ~20-byte positive
     // margin, confirmed by measuring the stack pointer directly at the time.
+    //
+    // High priority stops captures being lost under heavy ROM read traffic.
+    // At normal priority the CoCo's own boot, before it speaks this protocol,
+    // dropped captures with no trace - a ring-backlog high-water-mark
+    // diagnostic pegged at maximum.
+    const ora_address_monitor_options_t monitor_opts = {
+        .size     = sizeof(ora_address_monitor_options_t),
+        .priority = ORA_ADDRESS_MONITOR_PRIORITY_HIGH,
+    };
     bool monitor_ok = false;
     ora_result_t monitor_rc = setup_monitor(
         ring_buf,
         RING_ENTRIES_LOG2,
         ORA_MONITOR_MODE_CONTROL,
         RING_DATA_SIZE,
-        NULL
+        &monitor_opts
     );
     if (monitor_rc == ORA_RESULT_OK) {
         s_write_pos_ptr = s_get_write_pos();

@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.1.0] - 2026-08-16
+## [1.0.0] - 2026-08-16
 
 Initial version.  Bridges a DriveWire session between a CoCo/Dragon disk
 controller ROM and a real DriveWire server, over One ROM's RP2350 UART1
