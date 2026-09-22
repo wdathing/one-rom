@@ -54,6 +54,26 @@ jobs:
     - name: Run One ROM emulator tests
       run: ci/test-emu.sh ${{ matrix.socket }}
 
+  c-tests:
+    name: C tests
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    # These compile firmware C for the host, so they need neither Rust nor the
+    # Arm toolchain.  They do need the host compiler pinned in
+    # ci/c-compiler-version: the runner's default cc is GCC 13, which predates
+    # the -std=gnu23 these are built as.  ci/c-tests.sh defaults $CC to the
+    # pinned one, so nothing here names a version.
+    - name: Install host compiler
+      run: ci/install-c-compiler.sh
+
+    - name: Check log format strings
+      run: ci/check-log-formats.sh
+
+    - name: Run host C tests
+      run: ci/c-tests.sh
+
   firmware:
     name: Firmware and plugins
     runs-on: ubuntu-latest
@@ -98,7 +118,7 @@ jobs:
   release:
     name: Create GitHub release
     runs-on: ubuntu-latest
-    needs: [emulator-tests, firmware]
+    needs: [emulator-tests, c-tests, firmware]
     steps:
     - uses: actions/checkout@v4
 

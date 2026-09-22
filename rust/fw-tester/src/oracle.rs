@@ -31,7 +31,11 @@ fn apply_transforms(raw: &[u8], transforms: &[Transform], source: &str) -> Vec<u
                      (the odd-length size_handling interaction is not modelled by the tester)",
                     data.len(),
                 );
-                data.chunks_exact(2).flat_map(|w| [w[1], w[0]]).collect()
+                data.as_chunks::<2>()
+                    .0
+                    .iter()
+                    .flat_map(|&[a, b]| [b, a])
+                    .collect()
             }
 
             Transform::Deinterleave {
@@ -189,5 +193,11 @@ pub fn load(chip_config: &ChipConfig, chip_type: ChipType, base_dir: &std::path:
             result.resize(target, 0xAA);
             result
         }
+
+        // `SizeHandling` is `#[non_exhaustive]`.  The oracle is a deliberately
+        // independent statement of what the firmware should serve, so a new
+        // handling mode has to be written out here too rather than falling
+        // back to something plausible.
+        ref other => panic!("oracle has no size handling for {other:?}"),
     }
 }
