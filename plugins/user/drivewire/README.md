@@ -17,7 +17,7 @@ port directly.
 
 This plugin targets the **One ROM Fire 28 Rev C**, the only 28-pin variant
 with GPIO40/41 (RP2354B/QFN-80). Those two GPIOs are also this board's
-`SEL_A`/`SEL_B` image-select pads. **The `SEL_A`/`SEL_B` jumper must be left
+`SEL_C`/`SEL_D` image-select pads. **The `SEL_C`/`SEL_D` jumper must be left
 unpopulated** for the plugin to use them as UART1 - the firmware's own boot
 sequence stops driving pulls on them once image selection is read, but if
 the jumper itself is still soldered/populated it will electrically contend
