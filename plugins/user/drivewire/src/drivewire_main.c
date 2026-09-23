@@ -6,7 +6,7 @@
 //
 // Bridges a DriveWire session between a CoCo/Dragon disk controller ROM and
 // a real DriveWire server, over One ROM's RP2350 UART1 hardware (GPIO40 TX,
-// GPIO41 RX - the One ROM Fire 28 Rev C SEL_A/SEL_B pads, which must be left
+// GPIO41 RX - the One ROM Fire 28 Rev C SEL_C/SEL_D pads, which must be left
 // unpopulated on this board for those pins to be free - see README) rather
 // than the CoCo's own bit-banger serial port.
 //
@@ -363,7 +363,7 @@ static volatile uint16_t s_debug_write_checksum;
 
 // Brings up UART1 on GPIO40 (TX) / GPIO41 (RX) at DW_UART_BAUD, 8-N-1.
 //
-// GPIO40/41 are this board's SEL_A/SEL_B image-select pads.  The firmware's
+// GPIO40/41 are this board's SEL_C/SEL_D image-select pads.  The firmware's
 // own disable_sel_pins() clears their pull-ups/downs once boot's jumper read
 // is done, and the core firmware deliberately excludes them from its GPIO
 // use tracking (see firmware/src/plugin.c) - they are meant to be reclaimed
