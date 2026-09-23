@@ -1,4 +1,5 @@
 // Copyright (C) 2026 Piers Finlayson <piers@piers.rocks>
+// Copyright (C) 2026 William Athing
 //
 // MIT License
 //
