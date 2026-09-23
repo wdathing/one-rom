@@ -64,6 +64,7 @@ pub fn socket_pin_offset(chip_pins: u8, board_pins: u8) -> Option<i16> {
 /// Bundles the board, set-level configuration, and chip-type information
 /// that would otherwise be threaded individually through each derivation
 /// function.
+#[non_exhaustive]
 pub struct SlotContext {
     /// The board being targeted.
     pub board: Board,
@@ -98,7 +99,8 @@ pub struct SlotContext {
 
     /// When `true` and `bit_mode == BitMode16`, forces `AlgData0` with
     /// `word_size: 16` (native 16-bit word mode, ignoring `/BYTE`) rather
-    /// than the default `AlgData1`. No effect for `BitMode8`.
+    /// than the default `AlgData1`. No effect for `BitMode8`, or for a chip
+    /// with no 8-bit mode (see `reads_byte_pin`).
     pub force_16_bit: bool,
 
     /// Per-chip select and commoned control-line configuration for Multi

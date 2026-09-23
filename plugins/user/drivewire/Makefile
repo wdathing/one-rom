@@ -7,8 +7,8 @@ CC      := $(if $(TOOLCHAIN),$(TOOLCHAIN)/arm-none-eabi-gcc,arm-none-eabi-gcc)
 OBJCOPY := $(if $(TOOLCHAIN),$(TOOLCHAIN)/arm-none-eabi-objcopy,arm-none-eabi-objcopy)
 OBJDUMP := $(if $(TOOLCHAIN),$(TOOLCHAIN)/arm-none-eabi-objdump,arm-none-eabi-objdump)
 
-MAJOR_VERSION := 0
-MINOR_VERSION := 1
+MAJOR_VERSION := 1
+MINOR_VERSION := 0
 PATCH_VERSION := 0
 BUILD_VERSION := 0
 

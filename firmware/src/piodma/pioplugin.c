@@ -173,6 +173,28 @@ static v2_x_pin_gpios_t v2_get_x_pin_gpios(
     return result;
 }
 
+// Samples that must agree before the CS detector arms, and again before it
+// releases.  Three of a three instruction loop is nine PIO cycles, inside the
+// CS window of one access and well inside the gap between two.
+#define MONITOR_CS_SAMPLES 3
+
+// Instructions each CS monitor emits, checked before any is built because
+// APIO_ADD_INSTR does not bounds check.  Per algorithm, because a 40 pin part
+// in /BYTE mode has 12 left and one figure for all three would refuse monitors
+// that fit.
+#define MONITOR_CS_0_INSTRS 9
+#define MONITOR_CS_1_INSTRS 20
+#define MONITOR_CS_2_INSTRS 14
+
+static uint8_t monitor_cs_instrs(uint8_t alg) {
+    switch (alg) {
+        case ALG_CS_0: return MONITOR_CS_0_INSTRS;
+        case ALG_CS_1: return MONITOR_CS_1_INSTRS;
+        case ALG_CS_2: return MONITOR_CS_2_INSTRS;
+        default:       return APIO_MAX_PIO_INSTRS;
+    }
+}
+
 static void pio_setup_address_monitor_pios() {
     const onerom_rom_slot_t *slot = RUNTIME->current_rom_slot;
 
@@ -218,6 +240,20 @@ static void pio_setup_address_monitor_pios() {
     // Use the same block as the ROM serving CS/Data PIO, starting from
     // where it left off
     uint8_t cs_data_sm_pos = GET_PIO_BLOCK_INSTR_LEN(RUNTIME->cs_data_pio_block_info);
+
+    uint8_t cs_monitor_alg = slot->alg->alg_cs->alg;
+    uint8_t cs_monitor_instrs = monitor_cs_instrs(cs_monitor_alg);
+    if ((uint32_t)cs_data_sm_pos + cs_monitor_instrs > APIO_MAX_PIO_INSTRS) {
+        // LCOV_UNREACHABLE_START - the tightest combination is a 40 pin part
+        // in /BYTE mode, 12 instructions left against AlgCs0's 9.
+        ERR("CS monitor alg %u needs %u instructions, block %u has %u left",
+            (unsigned)cs_monitor_alg, (unsigned)cs_monitor_instrs,
+            (unsigned)cs_data_block,
+            (unsigned)(APIO_MAX_PIO_INSTRS - cs_data_sm_pos));
+        return;
+        // LCOV_UNREACHABLE_STOP
+    }
+
     APIO_SET_BLOCK_FROM_VAR(cs_data_block, cs_data_sm_pos);
 
     //
@@ -242,42 +278,40 @@ static void pio_setup_address_monitor_pios() {
     switch (cs_alg->alg) {
         case ALG_CS_0: {
             // All CS pins contiguous - CS active == zero
+            const onerom_alg_cs0_param_t *params = (const onerom_alg_cs0_param_t *)cs_alg->params;
+
+            // Y counts samples that agree and is reloaded by any that does
+            // not, so only an unbroken run moves the detector on.  Releasing
+            // used to take one sample, so a CS glitch within an access re-armed
+            // the detector and the address was captured twice.
             APIO_WRAP_BOTTOM();
             APIO_LABEL_NEW(cs_inactive);
+            APIO_ADD_INSTR(APIO_SET_Y(MONITOR_CS_SAMPLES - 1));
+            APIO_LABEL_NEW(cs_arming);
             APIO_ADD_INSTR(APIO_MOV_X_PINS);
-            const onerom_alg_cs0_param_t *params = (const onerom_alg_cs0_param_t *)cs_alg->params;
             if (params->serve_cs_low_0 == 0) {
-                // CS active == zero
-                APIO_ADD_INSTR(APIO_JMP_X_DEC(APIO_LABEL(cs_inactive)));
-                APIO_ADD_INSTR(APIO_MOV_X_PINS);
-                APIO_ADD_INSTR(APIO_JMP_X_DEC(APIO_LABEL(cs_inactive)));
-                APIO_ADD_INSTR(APIO_MOV_X_PINS);
-                APIO_ADD_INSTR(APIO_JMP_X_DEC(APIO_LABEL(cs_inactive)));
-                APIO_ADD_INSTR(APIO_MOV_X_PINS);
+                // CS active == zero, so a non-zero sample is inactive
                 APIO_ADD_INSTR(APIO_JMP_X_DEC(APIO_LABEL(cs_inactive)));
             } else {
                 // CS active == non-zero (pins inverted)
                 APIO_ADD_INSTR(APIO_JMP_NOT_X(APIO_LABEL(cs_inactive)));
-                APIO_ADD_INSTR(APIO_MOV_X_PINS);
-                APIO_ADD_INSTR(APIO_JMP_NOT_X(APIO_LABEL(cs_inactive)));
-                APIO_ADD_INSTR(APIO_MOV_X_PINS);
-                APIO_ADD_INSTR(APIO_JMP_NOT_X(APIO_LABEL(cs_inactive)));
-                APIO_ADD_INSTR(APIO_MOV_X_PINS);
-                APIO_ADD_INSTR(APIO_JMP_NOT_X(APIO_LABEL(cs_inactive)));
             }
+            APIO_ADD_INSTR(APIO_JMP_Y_DEC(APIO_LABEL(cs_arming)));
 
             APIO_ADD_INSTR(irq_set_instr);
 
             APIO_LABEL_NEW(cs_active);
+            APIO_ADD_INSTR(APIO_SET_Y(MONITOR_CS_SAMPLES - 1));
+            APIO_LABEL_NEW(cs_releasing);
             APIO_ADD_INSTR(APIO_MOV_X_PINS);
-            APIO_WRAP_TOP();
             if (params->serve_cs_low_0 == 0) {
-                // CS inactive == non-zero
+                // a zero sample is still active
                 APIO_ADD_INSTR(APIO_JMP_NOT_X(APIO_LABEL(cs_active)));
             } else {
-                // CS inactive == zero (pins inverted)
                 APIO_ADD_INSTR(APIO_JMP_X_DEC(APIO_LABEL(cs_active)));
             }
+            APIO_WRAP_TOP();
+            APIO_ADD_INSTR(APIO_JMP_Y_DEC(APIO_LABEL(cs_releasing)));
 
             // If multi-ROM mode, use only the first ROM's CS pins
             if ((params->first_rom_num_cs_pins > 0) && (params->first_rom_num_cs_pins < 0xFF)) {
@@ -311,8 +345,17 @@ static void pio_setup_address_monitor_pios() {
             // cs_active:
             APIO_ADD_INSTR(irq_set_instr);
 
+            // Releasing is confirmed by a second sample, as in AlgCs0.  Two
+            // rather than three because Y is taken by the ignored pin's mask.
             APIO_WRAP_BOTTOM();
             APIO_LABEL_NEW(test_if_inactive);
+            APIO_ADD_INSTR(APIO_MOV_X_PINS);
+            APIO_ADD_INSTR(APIO_JMP_NOT_X(APIO_LABEL(test_if_inactive)));
+            APIO_LABEL_NEW_OFFSET(releasing, 2);
+            APIO_ADD_INSTR(APIO_JMP_X_NOT_Y(APIO_LABEL(releasing)));
+            APIO_ADD_INSTR(APIO_JMP(APIO_LABEL(test_if_inactive)));
+
+            // releasing: still active on a second look means it was a glitch
             APIO_ADD_INSTR(APIO_MOV_X_PINS);
             APIO_ADD_INSTR(APIO_JMP_NOT_X(APIO_LABEL(test_if_inactive)));
             APIO_WRAP_TOP();
@@ -364,7 +407,15 @@ static void pio_setup_address_monitor_pios() {
             // host that walks the address from a deselected range back into a
             // selected one, without ever releasing the enable, is a fresh
             // access and must produce a fresh capture.
+            // Either release is confirmed by a second look, as in AlgCs0.
+            // Both the enable and the qualifiers can glitch.
             APIO_LABEL_NEW(cs_active_poll);
+            APIO_LABEL_NEW_OFFSET(cs_releasing, 3);
+            APIO_ADD_INSTR(APIO_JMP_PIN(APIO_LABEL(cs_releasing)));
+            APIO_ADD_INSTR(APIO_MOV_X_PINS);
+            APIO_ADD_INSTR(APIO_JMP_X_NOT_Y(APIO_LABEL(cs_active_poll)));
+
+            // cs_releasing: back either way means it was a glitch
             APIO_ADD_INSTR(APIO_JMP_PIN(APIO_LABEL(cs_inactive)));
             APIO_ADD_INSTR(APIO_MOV_X_PINS);
             APIO_WRAP_TOP();
@@ -466,7 +517,8 @@ static void pio_setup_address_monitor_dma(
     uint8_t sm_addr_read,
     volatile uint32_t *ring_buf,
     uint8_t ring_size_log2,
-    uint8_t data_size
+    uint8_t data_size,
+    uint8_t high_priority
 ) {
 #if REAL_HARDWARE
     uint32_t dma_data_size;
@@ -487,18 +539,10 @@ static void pio_setup_address_monitor_dma(
     dma_reg->ctrl_trig =
         DMA_CTRL_TRIG_EN |
         dma_data_size |
-        // High priority: this channel and the ROM-serving DMA channels are
-        // otherwise equal-priority round-robin peers on the AHB matrix, but
-        // serving is effectively always pending (every CPU read needs it
-        // serviced in time to present valid data), so a sustained burst of
-        // reads - e.g. a target CPU's own boot sequence, well before it ever
-        // touches this plugin's protocol - can starve this channel's 4-deep
-        // hardware RX FIFO of AHB grants long enough to overflow it, silently
-        // losing captures with no trace downstream.  Confirmed in practice on
-        // the drivewire plugin: a ring-buffer backlog high-water-mark
-        // diagnostic pegged at the maximum representable value during a
-        // target's boot, consistent with exactly this.
-        DMA_CTRL_TRIG_PRIORITY_HIGH |
+        // ROM serving's channels (piorom2.c) run at normal priority, so at
+        // high priority this channel is arbitrated ahead of them - see
+        // ora_address_monitor_priority_t for the trade.
+        (high_priority ? DMA_CTRL_TRIG_PRIORITY_HIGH : 0) |
         DMA_CTRL_RING_SIZE(ring_size_log2) |
         DMA_CTRL_RING_SEL |
         DMA_CTRL_INCR_WRITE |
@@ -514,6 +558,7 @@ static void pio_setup_address_monitor_dma(
     // chose to the injected configure seam, which wires up epio's capture
     // channel from that choice (so a wrong block choice is caught).
     (void)dma_ch;
+    (void)high_priority;
     if (s_host_monitor_dma_configure != NULL) {
         s_host_monitor_dma_configure(block, sm_addr_read, (void *)ring_buf,
                                      ring_size_log2, data_size);
@@ -526,10 +571,22 @@ ora_result_t pio_setup_address_monitor(
     uint8_t ring_entries_log2,
     ora_monitor_mode_t mode,
     uint8_t data_size,
-    void *reserved
+    const ora_address_monitor_options_t *options
 ) {
     (void)mode;
-    (void)reserved;
+
+    // Read only the fields the caller's size covers.  Both fields shipped
+    // together, so one check covers them.
+    uint8_t high_priority = 0;
+    if (options != NULL) {
+        if (options->size < sizeof(ora_address_monitor_options_t)) {
+            return ORA_RESULT_INVALID_SIZE;
+        }
+        if (options->priority > ORA_ADDRESS_MONITOR_PRIORITY_HIGH) {
+            return ORA_RESULT_INVALID_ARG;
+        }
+        high_priority = (options->priority == ORA_ADDRESS_MONITOR_PRIORITY_HIGH);
+    }
 
     uint32_t bytes_per_entry_log2 = __builtin_ctz(data_size / 8); // 8->0, 16->1, 32->2
     uint32_t ring_size_log2 = ring_entries_log2 + bytes_per_entry_log2;
@@ -552,7 +609,8 @@ ora_result_t pio_setup_address_monitor(
         SM_ADDR_MONITOR_ADDR_READ,
         ring_buf,
         ring_size_log2,
-        data_size
+        data_size,
+        high_priority
     );
 
     return ORA_RESULT_OK;
@@ -1257,6 +1315,20 @@ void set_host_sram_ptr(uint8_t *ptr) {
     s_host_sram_ptr = ptr;
 }
 
+// A hook rather than a direct call, because the test library is linked by
+// testers that have no recorder to call.
+static void (*s_sram_write_hook)(uint32_t addr, uint8_t val);
+
+void set_host_sram_write_hook(void (*hook)(uint32_t addr, uint8_t val)) {
+    s_sram_write_hook = hook;
+}
+
+void report_host_sram_write(uint32_t addr, uint8_t val) {
+    if (s_sram_write_hook != NULL) {
+        s_sram_write_hook(addr, val);
+    }
+}
+
 uint8_t *sram_to_host(uint32_t addr) {
     if (s_host_sram_ptr != NULL) {
         return s_host_sram_ptr + (addr - SRAM_BASE);
@@ -1470,6 +1542,13 @@ ora_result_t pio_reprogram_ram_rom_slot(
         uint32_t physical_addr = pio_map_addr_to_phys(CURRENT_SLOT, offset + i);
         uint8_t  physical_data = pio_map_data_to_phys(CURRENT_SLOT, data[i]);
         sram[physical_addr] = physical_data;
+#if !REAL_HARDWARE
+        // Under the device address, as ORA_SRAM_WRITE8 reports a plugin's own
+        // stores, so the two interleave in one record.
+        if (s_sram_write_hook != NULL) {
+            s_sram_write_hook(addr + physical_addr, physical_data);
+        }
+#endif
     }
 
     return ORA_RESULT_OK;

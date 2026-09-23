@@ -24,7 +24,7 @@ use onerom_metadata::BitModes;
 
 use crate::image::{ChipSetType, CsConfig, CsLogic};
 use crate::v2::addr_layout::{LayoutError, derive_addr_layout};
-use crate::v2::alg_config::bit_mode_for;
+use crate::v2::alg_config::{bit_mode_for, reads_byte_pin};
 use crate::v2::alg_preference::{
     AddrAlgPreference, CsAlgPreference, DataAlgPreference, cs_alg_preference,
 };
@@ -214,6 +214,7 @@ pub fn default_cs_config(chip_type: ChipType) -> CsConfig {
 /// very different numbers of cycles, and which case applies depends on the
 /// board's routing as much as on the chip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ServingAlgInfo {
     /// First GPIO the address state machine samples.
     pub addr_window_base: u8,
@@ -296,9 +297,10 @@ pub fn serving_alg_info(
             cs_data_layout.alg_cs2.as_ref(),
         ),
         addr_alg: AddrAlgPreference::AlgAddr0,
-        data_alg: match (bit_mode, force_16_bit) {
-            (BitModes::BitMode16, false) => DataAlgPreference::AlgData1,
-            _ => DataAlgPreference::AlgData0,
+        data_alg: if reads_byte_pin(chip_type, bit_mode, force_16_bit) {
+            DataAlgPreference::AlgData1
+        } else {
+            DataAlgPreference::AlgData0
         },
     })
 }
