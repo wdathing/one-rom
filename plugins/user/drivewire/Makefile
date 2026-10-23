@@ -9,7 +9,7 @@ OBJCOPY := $(if $(TOOLCHAIN),$(TOOLCHAIN)/arm-none-eabi-objcopy,arm-none-eabi-ob
 OBJDUMP := $(if $(TOOLCHAIN),$(TOOLCHAIN)/arm-none-eabi-objdump,arm-none-eabi-objdump)
 
 MAJOR_VERSION := 1
-MINOR_VERSION := 0
+MINOR_VERSION := 1
 PATCH_VERSION := 0
 BUILD_VERSION := 0
 

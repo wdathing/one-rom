@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.1.0] - 2026-10-23
+
+The plugin now receives a cartridge image FujiNet pushes automatically when a ROM is
+mounted, rather than requesting one. `!LDCART!` now activates an already-pushed image
+instead of triggering the pull - a breaking change for any CoCo-side client expecting
+the old request-based behaviour.
+- This required a firmware update.
+
 ## [1.0.0] - 2026-08-16
 
 Initial version.  Bridges a DriveWire session between a CoCo/Dragon disk
