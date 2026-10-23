@@ -653,6 +653,57 @@ ora_result_t pio_setup_address_monitor(
 // Step 3: Banked X bits.
 //   Currently targets bank 0 only (X bits remain 0).
 //   TODO: add explicit bank selection when required.
+// Bit positions within [0, num_addr_pins) that pio_map_addr_to_phys()'s own
+// address-bit loop never sets for this slot's chip type - i.e. GPIOs that
+// fall inside the contiguous capture span (addr_base .. addr_base +
+// num_addr_pins - 1) purely because the span is sampled as one block, but
+// aren't wired to a real address line for THIS chip (e.g. VPP on a 27128,
+// which a board's socket may still list as an address pin for a larger
+// chip type the same socket also supports - see fire-28-c.json's "addr"
+// list vs. a given chip-type's own, shorter pin count). A live read's
+// physical index includes whatever that pin actually reads as, which
+// nothing here drives or defines - so a byte stored at only one combination
+// of these bits is correct for exactly one of the 2^N physically-reachable
+// locations a real access could land on, and wrong for the others,
+// depending on what that floating pin happens to read.
+//
+// Deliberately independent of pio_get_unobserved_addr_bits(): its own doc
+// comment scopes it to low-order/LSB-omitted bits (the word-mode A-1 case),
+// not a gap that can fall anywhere within the span, so it is not assumed
+// to describe this case correctly. This instead derives the mask directly
+// from the same pin_map->addr[] scan pio_map_addr_to_phys() itself uses.
+//
+// Restricted to slot types pio_map_addr_to_phys() never sets any other
+// bit for within the address span: Multi sets CS bits there (Step 2) and
+// Banked reserves bits for X (Step 3), both computed the same
+// gpio - addr_base way a real gap bit is, and this function has no way to
+// tell a real CS/X bit apart from an actual gap without duplicating that
+// logic here too. Returning 0 (no-op - exactly the prior, single-write
+// behaviour) for those leaves them untouched rather than risk writing a
+// Multi/Banked slot's real selector bits as if they were free to toggle.
+static uint32_t pio_addr_gap_mask(const onerom_rom_slot_t *slot) {
+    if (slot->slot_type == ROM_SLOT_TYPE_MULTI_ROM ||
+        slot->slot_type == ROM_SLOT_TYPE_BANKED_ROM) {
+        return 0;
+    }
+
+    const onerom_alg_addr_config_t *addr_alg = slot->alg->alg_addr;
+    const onerom_rom_pin_map_t     *pin_map  = slot->roms[0]->pin_map;
+    uint8_t  addr_base = addr_alg->gpio_base + addr_alg->base_addr_pin;
+    uint32_t occupied = 0;
+
+    for (uint8_t n = 0; n < MAX_ADDR_PINS; n++) {
+        uint8_t gpio = pin_map->addr[n];
+        if (gpio >= GPIO_NONE) break;
+        occupied |= (1u << (gpio - addr_base));
+    }
+
+    uint32_t full = (addr_alg->num_addr_pins >= 32u)
+                        ? 0xFFFFFFFFu
+                        : ((1u << addr_alg->num_addr_pins) - 1u);
+    return full & ~occupied;
+}
+
 uint32_t pio_map_addr_to_phys(
     const onerom_rom_slot_t *slot,
     uint32_t logical_addr
@@ -1538,17 +1589,33 @@ ora_result_t pio_reprogram_ram_rom_slot(
 #else
     uint8_t *sram = sram_to_host(addr);
 #endif
+    // gap_mask's bits are address-span positions pio_map_addr_to_phys()
+    // never sets - see pio_addr_gap_mask()'s own comment. base_phys always
+    // has them at 0; writing every byte to every combination of them too
+    // (the classic "enumerate all submasks" descent: combo starts at
+    // gap_mask, each step takes (combo-1) & gap_mask, terminating after 0
+    // is processed) means a live read lands on the right data no matter
+    // what a gap bit's undriven GPIO happens to read as. gap_mask is 0 for
+    // every chip type that doesn't have one, so this is a single iteration
+    // (the prior behaviour) in the common case.
+    uint32_t gap_mask = pio_addr_gap_mask(CURRENT_SLOT);
     for (uint32_t i = 0; i < len; i++) {
-        uint32_t physical_addr = pio_map_addr_to_phys(CURRENT_SLOT, offset + i);
+        uint32_t base_phys    = pio_map_addr_to_phys(CURRENT_SLOT, offset + i);
         uint8_t  physical_data = pio_map_data_to_phys(CURRENT_SLOT, data[i]);
-        sram[physical_addr] = physical_data;
+        uint32_t combo = gap_mask;
+        for (;;) {
+            uint32_t physical_addr = base_phys | combo;
+            sram[physical_addr] = physical_data;
 #if !REAL_HARDWARE
-        // Under the device address, as ORA_SRAM_WRITE8 reports a plugin's own
-        // stores, so the two interleave in one record.
-        if (s_sram_write_hook != NULL) {
-            s_sram_write_hook(addr + physical_addr, physical_data);
-        }
+            // Under the device address, as ORA_SRAM_WRITE8 reports a plugin's own
+            // stores, so the two interleave in one record.
+            if (s_sram_write_hook != NULL) {
+                s_sram_write_hook(addr + physical_addr, physical_data);
+            }
 #endif
+            if (combo == 0) break;
+            combo = (combo - 1) & gap_mask;
+        }
     }
 
     return ORA_RESULT_OK;

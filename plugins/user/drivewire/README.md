@@ -39,7 +39,7 @@ this plugin does not use it):
 
 ```bash
 onerom program --plugin usb --plugin file=drivewire/build/drivewire_plugin.bin \
-  --slot file=/path/to/hdbonerom.rom,type=2764,cs1=active-low
+  --slot file=/path/to/hdbonerom.rom,type=27128,size-handling=duplicate
 ```
 
 ## Wire protocol

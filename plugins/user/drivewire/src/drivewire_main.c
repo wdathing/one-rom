@@ -123,7 +123,7 @@ static uint32_t            s_read_idx;
 static const uint8_t s_knock_write[KNOCK_LEN] = {'!','D','W','S','E','N','D','!'};  // "!DWSEND!" CoCo -> server
 #ifndef DRIVEWIRE_TEST_PATTERN
 static const uint8_t s_knock_read[KNOCK_LEN]  = {'!','D','W','R','E','C','V','!'};  // "!DWRECV!" server -> CoCo
-// CoCo -> plugin: load and activate a cartridge/ROM image - see
+// CoCo -> plugin: activate an already-pushed cartridge/ROM image - see
 // drivewire_do_load_cart()'s own comment for the full protocol.  Not part of
 // DriveWire proper - a One-ROM-specific extension the config app's own
 // knock-sending code (not fujinet-lib, not hdbdos) speaks directly.
@@ -165,6 +165,22 @@ static const uint8_t s_knock_cart[KNOCK_LEN]  = {'!','L','D','C','A','R','T','!'
 #define DW_KNOCK_ACK_ADDR  0x0200u
 #define DW_KNOCK_ACK_VALUE 0xA5u
 
+// The "!LDCART!" status block, in a different page from DW_KNOCK_ACK_ADDR so
+// it coexists with that mechanism untouched. drivewire_do_load_cart() writes
+// all five of these (into slot 0, still active at that point) before
+// switching to the cart, so fujinet-config's onerom_load_cart() can confirm
+// not just that the load happened but what was actually pushed -
+// independently re-checksumming the activated cart's own memory afterward,
+// and refusing to jump into it on a mismatch. Length/checksum are only
+// meaningful when the status byte is DW_CART_STATUS_SUCCESS.
+#define DW_CART_STATUS_ADDR    0x0210u
+#define DW_CART_LEN_LO_ADDR    0x0211u
+#define DW_CART_LEN_HI_ADDR    0x0212u
+#define DW_CART_CKSUM_LO_ADDR  0x0213u
+#define DW_CART_CKSUM_HI_ADDR  0x0214u
+#define DW_CART_STATUS_SUCCESS 0x00u
+#define DW_CART_STATUS_FAILURE 0xFFu
+
 #define DW_UART_BASE     UART1_BASE
 #define DW_UART_TX_GPIO  40u
 #define DW_UART_RX_GPIO  41u
@@ -185,18 +201,80 @@ static const uint8_t s_knock_cart[KNOCK_LEN]  = {'!','L','D','C','A','R','T','!'
 // coming rather than shaving margin off any legitimately slow response.
 #define DW_UART_GETC_TIMEOUT 300000000ul
 
+// DBC (FujiBusPacket) SLIP framing and command bytes - see the "DBC
+// (FujiBusPacket)" section further down for how these are used.  Hoisted up
+// here because drivewire_do_read() needs DBC_SLIP_END to tell an unprompted
+// cartridge push apart from the start of an ordinary reply, before it has
+// read enough to know which one it's looking at.
+#define DBC_SLIP_END       0xC0u
+#define DBC_SLIP_ESC       0xDBu
+#define DBC_SLIP_ESC_END   0xDCu
+#define DBC_SLIP_ESC_ESC   0xDDu
+
+#define DBC_FUJI_DEVICEID  0xFFu
+#define DBC_CMD_NET_OPEN   0x4Fu
+#define DBC_CMD_NET_WRITE  0x57u
+#define DBC_CMD_NET_CLOSE  0x43u
+#define DBC_CMD_FUJI_ACK   0x06u
+#define DBC_CMD_FUJI_NAK   0x15u
+
+#define DBC_HEADER_LEN     6u   // device, command, length(lo,hi), checksum, descr
+
+// Worst case for a header probe's raw byte capture: every one of
+// DBC_HEADER_LEN decoded bytes arrived as a 2-byte SLIP escape pair.
+#define DBC_PROBE_RAW_CAP (2u * DBC_HEADER_LEN)
+
+// Ordinary (non-DBC) OP_FUJI opcode/command bytes drivewire_do_write() looks
+// for as it relays a write, to arm cartridge-push detection - see that
+// function's own comment.  FUJI_OP_FUJI matches dw.h's OP_FUJI; the two
+// commands match fujinet-fuji.h's FUJICMD_MOUNT_IMAGE/FUJICMD_MOUNT_ALL -
+// both are CoCo-client-initiated mount requests that can trigger FujiNet to
+// push a ROM image (see fuji_mount_disk_image.c/fuji_mount_all.c in
+// fujinet-lib).
+#define FUJI_OP_FUJI         0xE2u
+#define FUJI_CMD_MOUNT_IMAGE 0xF8u
+#define FUJI_CMD_MOUNT_ALL   0xD7u
+
+// How long, in drivewire_next_addr() loop iterations, to keep watching for
+// a cartridge push after arming - see drivewire_do_write()'s own comment.
+// Every armed window is exposed to the push-probe's own residual
+// false-positive risk against ordinary disk traffic (see
+// dbc_header_looks_like_push()'s own comment) - and since
+// FUJICMD_MOUNT_IMAGE/MOUNT_ALL share their opcode prefix with an ordinary
+// (non-ROM) disk mount, arming can't tell which one it's looking at yet, so
+// this cost is paid on most mounts, not just ROM ones.  A too-generous
+// budget turns a rare, tightened-gate false positive into a near-certain
+// one by simply running it over far more bytes of real traffic than needed.
+//
+// Confirmed on real hardware (2026-10-17): the previous value (100000000)
+// was still armed a full 26.5 seconds after an ordinary (non-ROM)
+// FUJICMD_MOUNT_IMAGE, and a false positive on the sector-read burst that
+// followed caused a real checksum error on the CoCo side - roughly 25+
+// seconds of pure unnecessary exposure beyond the ~1 second mount+push
+// latency this is actually sized for (FujiNet's own SD card access, plus
+// the CoCo-side bus_ready()/fuji_get_error() retry dance - see the "DBC
+// (FujiBusPacket)" section's own history of bugs #2 and #3).  That one data
+// point upper-bounds this loop's iteration rate at 100000000/26.5s ~=
+// 3.77M/s; this value targets roughly 2 seconds of coverage even if the
+// real rate turns out to be that fast, a healthy margin over the observed
+// latency.  Still a starting value, not a measured one - the real
+// iteration rate hasn't been directly measured, only bounded from below by
+// this single real-hardware data point.
+#define DW_PUSH_ARM_BUDGET 10000000ul
+
 typedef enum {
     SESSION_WRITE,
     SESSION_READ,
     SESSION_LOAD_CART,
 } session_dir_t;
 
-// Dedicated RAM slot "!LDCART!" loads a cartridge image into - deliberately
-// never the currently-active slot (slot 0, hdbonerom.rom in this plugin's
-// own build), so the transfer can never corrupt what the CoCo might still
-// be executing from, and drivewire_do_load_cart() only ever needs
-// allow_active=0 when reprogramming it.  See that function's own comment
-// for the full handshake.
+// Dedicated RAM slot a pushed cartridge image is received into (see
+// drivewire_dbc_receive_cart()) and "!LDCART!" later activates (see
+// drivewire_do_load_cart()) - deliberately never the currently-active slot
+// (slot 0, hdbonerom.rom in this plugin's own build), so the transfer can
+// never corrupt what the CoCo might still be executing from, and
+// drivewire_dbc_receive_cart() only ever needs allow_active=0 when
+// reprogramming it.  See that function's own comment for the full handshake.
 #define DW_CART_RAM_SLOT 1u
 
 // ---------------------------------------------------------------------------
@@ -225,18 +303,92 @@ static uint8_t s_orig_status_byte;
 static uint8_t s_orig_data_byte;
 static uint8_t s_orig_ack_byte;
 
+// Set once drivewire_dbc_receive_cart() has written a complete cartridge
+// image into DW_CART_RAM_SLOT, and cleared the instant drivewire_do_load_cart()
+// consumes it.  This is what lets "!LDCART!" simply ask "is one ready" rather
+// than requesting and receiving the push itself - see
+// drivewire_receive_confirmed_push()'s own comment for where a push
+// actually gets noticed and received.
+static bool s_cart_pending;
+
+// Bytes of DW_CART_RAM_SLOT the CoCo can actually address: the served chip
+// type's own size (16K for a 27128), resolved once by drivewire_setup(), or 0
+// if that lookup failed.  Not the slot size ora_get_ram_slot_info() reports -
+// that is the whole ROM-table region (64K on 28-pin), and a logical offset
+// past the chip's own address lines doesn't fail on reprogram, it silently
+// lands on offset % chip size.  Bounding writes by the region instead let
+// drivewire_dbc_receive_cart()'s mirror fill run on to 64K, overwriting the
+// image it had just received with shifted copies of itself - any image size
+// not dividing 16K evenly (a 16128-byte $C000-$FEFF dump being the common
+// case) arrived corrupted.
+static uint32_t s_cart_window_size;
+
+// Length and plain-sum checksum of the
+// cartridge image actually received, tracked alongside s_cart_pending by
+// drivewire_dbc_receive_cart() and reported to the CoCo by
+// drivewire_do_load_cart() - see DW_CART_LEN_LO_ADDR and friends.
+static uint16_t s_cart_received_len;
+static uint16_t s_cart_received_checksum;
+
 // Holds a full read session's response, drained from UART1 before any of the
 // CoCo handshake starts - see drivewire_do_read().  256 is the protocol's
 // maximum single-session count (0 on the wire means 256).
 static uint8_t s_read_buf[256];
 
-// How many bytes at the front of s_read_buf were opportunistically drained
-// from UART1 by drivewire_next_addr() before drivewire_do_read() was even
-// entered - see its own comment.  Reset once a session finishes with it (a
-// read session in drivewire_do_read() itself; a write session explicitly, in
-// drivewire_wait_for_knock() below, before the next wait starts) so stale
-// bytes from one session's window can never bleed into the next.
+// How many bytes at the front of s_read_buf are already filled in before
+// drivewire_do_read()'s own per-byte collection loop starts: either
+// drivewire_next_addr()'s opportunistic drain (see its own comment), or
+// drivewire_push_probe_feed() replaying the raw bytes of a push attempt
+// that turned out not to be one after all (see that function's own
+// comment).  Reset to 0 once a read session consumes it in
+// drivewire_do_read(), so stale bytes from one session's window can never
+// bleed into the next.
 static uint16_t s_read_buf_filled;
+
+// Gates whether drivewire_next_addr()'s opportunistic drain engages
+// drivewire_push_probe_feed() at all.  Set only by drivewire_do_write()
+// recognizing a ROM-mount-triggering write (see its own comment) - content-
+// based, not scoped by session phase, after confirming on real hardware
+// that phase-based scoping (on by default while idly scanning between
+// sessions) still exposed the bulk of every ordinary sector reply to the
+// prober, since that is exactly where a fast-arriving reply gets caught
+// before its own read knock is even sent.  Cleared by
+// drivewire_next_addr() once s_push_probe_arm_budget runs out with nothing
+// confirmed.
+static bool s_push_probe_enabled;
+
+// Countdown started by drivewire_do_write() on arming and decremented by
+// drivewire_next_addr() on every pass while armed and idle (not mid-probe) -
+// see DW_PUSH_ARM_BUDGET's own comment.  Reset back to that same budget by
+// drivewire_receive_confirmed_push() on a successful receive, in case
+// FUJICMD_MOUNT_ALL pushes more than one slot.
+static uint32_t s_push_probe_arm_budget;
+
+// drivewire_push_probe_feed()'s own state, persisted across however many
+// calls it takes a candidate header to arrive one byte at a time - see its
+// own comment for why this must never block waiting for more.
+// PUSH_PROBE_IDLE between candidates; PUSH_PROBE_IN_HEADER while one is
+// being probed.
+typedef enum {
+    PUSH_PROBE_IDLE,
+    PUSH_PROBE_IN_HEADER,
+} push_probe_state_t;
+static push_probe_state_t s_push_probe_state;
+static uint8_t  s_push_probe_header[DBC_HEADER_LEN];
+static uint16_t s_push_probe_decoded_len;
+static uint8_t  s_push_probe_chk;
+static bool     s_push_probe_escape;
+static uint8_t  s_push_probe_raw[DBC_PROBE_RAW_CAP];
+static uint16_t s_push_probe_raw_len;
+
+// Set by drivewire_push_probe_feed() the instant a candidate header's own
+// fields check out, holding the validated header and running checksum for
+// drivewire_receive_confirmed_push() to finish receiving - see both
+// functions' own comments for why detecting and receiving a push are split
+// across two different places.  Cleared the instant that receive starts.
+static bool    s_cart_push_confirmed;
+static uint8_t s_cart_push_header[DBC_HEADER_LEN];
+static uint8_t s_cart_push_chk;
 
 // Main session loop's own state, one level up from drivewire_do_read()'s own
 // variables above - these cover write sessions and knock-waiting too, so a
@@ -359,6 +511,76 @@ static volatile uint32_t s_debug_sticky_rsr;
 static volatile uint8_t  s_debug_write_bytes[DEBUG_WRITE_BYTES];
 static volatile uint16_t s_debug_write_byte_count;
 static volatile uint16_t s_debug_write_checksum;
+
+// ---------------------------------------------------------------------------
+// DBC (FujiBusPacket) helpers shared by both header-probing paths
+// ---------------------------------------------------------------------------
+//
+// Hoisted up here, ahead of drivewire_next_addr() and drivewire_do_write(),
+// which need them - see the "DBC (FujiBusPacket)" section further down for
+// the rest of this machinery and its own fuller comment on why a cartridge
+// push can arrive unprompted at all.
+
+// Folds one more byte into a running checksum - matches FujiBusPacket's
+// calcChecksum() exactly (an 8-bit add-with-end-around-carry), which stays a
+// clean 0-255 value after every call since the largest possible pre-fold sum
+// is 255+255.
+static uint8_t dbc_checksum_add(uint8_t chk, uint8_t b) {
+    uint16_t sum = (uint16_t)chk + b;
+    return (uint8_t)((sum >> 8) + (sum & 0xFFu));
+}
+
+// A genuine push's first frame's own exact, fixed shape - verified against
+// FujiBusPacket::serialize() (centi-fuji's lib/bus/rs232/FujiBusPacket.cpp),
+// not just inferred from push_rom_image()'s own call site.
+// push_rom_image() opens with `sendCommand(DBC, NET_OPEN, (uint16_t)0)` - a
+// single *packed* 2-byte parameter, not a raw data payload.  serialize()
+// encodes exactly one packed field as descr byte 0x05 (field count 1, plus
+// FUJI_DESCR_EXCEEDS_U8 for a field wider than a byte) with no additional
+// descriptor bytes, giving a fixed on-wire length of DBC_HEADER_LEN + 2 -
+// the 2-byte parameter itself, carrying no actual information (always the
+// literal value 0).  Notably, NET_OPEN carries no image size at all,
+// contrary to what an earlier version of this code (and of
+// drivewire_dbc_receive_cart()'s own NET_OPEN handling) assumed - see that
+// function's own comment for the fix.
+#define DBC_FIRST_FRAME_DESCR  0x05u
+#define DBC_FIRST_FRAME_LEN    (DBC_HEADER_LEN + 2u)
+
+// Checks whether a decoded 6-byte DBC header's own fields are consistent
+// with a genuine cartridge push's *first* frame - rather than it merely
+// starting with DBC_SLIP_END by coincidence of whatever ordinary data it
+// actually is.  Used by drivewire_push_probe_feed() and
+// drivewire_resolve_pushed_cart(), both of which only ever see a push's own
+// opening frame (dbc_recv_frame(), fetching a second or later frame once a
+// push is already confirmed under way, never needs this check at all) - so
+// this requires command to be NET_OPEN specifically and descr/length to
+// exactly match that frame's own fixed shape (DBC_FIRST_FRAME_DESCR/_LEN) -
+// not a range, since push_rom_image()'s NET_OPEN call never varies.
+//
+// This matters because a coincidental match here is not a cheap mistake:
+// once this gate passes, the bytes that follow are consumed directly off
+// the UART stream with no way to un-consume them if the *rest* of the frame
+// then fails to validate (its own checksum, in particular, which can only
+// be checked once the whole claimed length has arrived) - unlike a failed
+// probe during the header itself, which stays recoverable by replaying its
+// raw bytes.  Confirmed on real hardware: an earlier, looser version of
+// this check let the plugin start consuming a supposed push's "payload"
+// that was actually the real reply to an ordinary read, with nothing left
+// to serve the CoCo once that payload turned out not to validate - and
+// since hdbdos's own DWRead has no timeout on the CoCo side, that reply
+// never arriving hung the CoCo indefinitely with no error ever reported.
+// Matching NET_OPEN's own fixed shape exactly, rather than a range, makes a
+// structured (non-random) disk image's own data dramatically less likely
+// to pass this specific combination by coincidence, without needing to
+// solve - or afford the RAM for - replaying an arbitrarily large false
+// payload.
+static bool dbc_header_looks_like_push(const uint8_t header[DBC_HEADER_LEN]) {
+    uint16_t claimed_len = (uint16_t)header[2] | ((uint16_t)header[3] << 8);
+    return header[0] == DBC_FUJI_DEVICEID &&
+           header[1] == DBC_CMD_NET_OPEN &&
+           header[5] == DBC_FIRST_FRAME_DESCR &&
+           claimed_len == DBC_FIRST_FRAME_LEN;
+}
 
 // ---------------------------------------------------------------------------
 // UART1
@@ -506,6 +728,130 @@ static bool drivewire_uart_getc(uint8_t *out) {
 // Address bus signalling
 // ---------------------------------------------------------------------------
 
+// Defined with the rest of the DBC machinery, below - forward-declared here
+// since drivewire_wait_for_knock()/drivewire_do_write() are where it gets
+// called, right after whichever of them notices drivewire_push_probe_feed()
+// has confirmed a push.
+static void drivewire_receive_confirmed_push(void);
+
+// Opportunistic-drain's per-byte handler for an unprompted cartridge push -
+// see the "DBC (FujiBusPacket)" section further down for the fuller
+// picture.  Only ever engaged while s_push_probe_enabled is set - content-
+// armed by drivewire_do_write() recognizing a ROM-mount-triggering write
+// (see its own comment), not scoped to any particular caller of
+// drivewire_next_addr(): once armed, this runs from inside both
+// drivewire_wait_for_knock()'s knock-scan and drivewire_do_write()'s own
+// relay loop, since a push can legally start arriving during either (see
+// the "DBC (FujiBusPacket)" section's own history of why one of those two
+// alone was not enough).  Fed exactly one UART1 RX byte per call - the same
+// byte the opportunistic drain would otherwise have stashed into
+// s_read_buf unconditionally - and persists its own state (s_push_probe_*)
+// across calls, since a header can take several calls to arrive one byte
+// at a time.  Must never itself wait for more; it only ever acts on the one
+// byte it was just handed.
+//
+// While idle, a non-DBC_SLIP_END byte goes to s_read_buf exactly as before
+// (the common case, zero added cost beyond this dispatch).  A
+// DBC_SLIP_END starts a probe instead of being stashed immediately -
+// dbc_header_looks_like_push()'s own comment explains why a lone marker
+// byte was never trustworthy on its own.  Declining to start a new probe
+// while s_cart_push_confirmed is already set (a prior one is still awaiting
+// receipt) is deliberate: drivewire_wait_for_knock()/drivewire_do_write()
+// each check and act on that flag immediately after the very call that can
+// set it, so two pushes queuing up here at once should never happen in
+// practice, but treating the byte as ordinary data in that instant is
+// trivially safe, whereas overwriting s_cart_push_header before anyone has
+// read it would lose the first push outright.
+//
+// Once DBC_HEADER_LEN logical bytes have been probed, the header's own
+// fields decide: if they hold up, the raw probed bytes are discarded for
+// good and s_cart_push_confirmed is set; if not, every raw byte probed -
+// the leading DBC_SLIP_END included - is replayed into s_read_buf verbatim,
+// so a false alarm costs nothing and loses no data.
+static void drivewire_push_probe_feed(uint8_t b) {
+    if (s_push_probe_state == PUSH_PROBE_IDLE) {
+        if (b != DBC_SLIP_END || s_cart_push_confirmed) {
+            if (s_read_buf_filled < sizeof(s_read_buf)) {
+                s_read_buf[s_read_buf_filled++] = b;
+            }
+            return;
+        }
+        s_push_probe_state       = PUSH_PROBE_IN_HEADER;
+        s_push_probe_escape      = false;
+        s_push_probe_decoded_len = 0;
+        s_push_probe_chk         = 0;
+        s_push_probe_raw_len     = 0;
+        return;
+    }
+
+    // PUSH_PROBE_IN_HEADER
+    if (s_push_probe_raw_len < sizeof(s_push_probe_raw)) {
+        s_push_probe_raw[s_push_probe_raw_len++] = b;
+    }
+
+    bool have_byte = false;
+    uint8_t decoded_byte = 0;
+    bool malformed = false;
+
+    if (s_push_probe_escape) {
+        s_push_probe_escape = false;
+        if (b == DBC_SLIP_ESC_END) { decoded_byte = DBC_SLIP_END; have_byte = true; }
+        else if (b == DBC_SLIP_ESC_ESC) { decoded_byte = DBC_SLIP_ESC; have_byte = true; }
+        // else: malformed escape - abort the probe rather than leniently
+        // dropping it and continuing (unlike dbc_recv_frame_payload()'s own
+        // leniency, mirroring decodeSLIP(), once a push is already
+        // confirmed).  A real DBC sender never emits an invalid escape
+        // pair, so this is itself proof this isn't one - and critically,
+        // "drop and keep going" has no bound on how many more raw bytes a
+        // probe might consume before DBC_HEADER_LEN decoded bytes finally
+        // accumulate, which can silently exceed s_push_probe_raw's fixed
+        // capacity and truncate what gets replayed on a false alarm.
+        // Confirmed on real hardware: ordinary sector data - effectively
+        // random binary - produces exactly this often enough to cause
+        // frequent, real checksum errors once probing runs on every byte
+        // rather than once per write.
+        else { malformed = true; }
+    } else if (b == DBC_SLIP_END) {
+        if (s_push_probe_decoded_len != 0) {
+            malformed = true;  // frame ended before a full header - not real
+        }
+        // else: just the frame's own opening marker, repeated
+    } else if (b == DBC_SLIP_ESC) {
+        s_push_probe_escape = true;
+    } else {
+        decoded_byte = b;
+        have_byte = true;
+    }
+
+    if (have_byte) {
+        s_push_probe_header[s_push_probe_decoded_len] = decoded_byte;
+        s_push_probe_chk = dbc_checksum_add(s_push_probe_chk,
+            s_push_probe_decoded_len == 4u ? 0u : decoded_byte);
+        s_push_probe_decoded_len++;
+    }
+
+    if (!malformed && s_push_probe_decoded_len < DBC_HEADER_LEN) {
+        return;  // keep waiting for more header bytes, one call at a time
+    }
+
+    if (!malformed && dbc_header_looks_like_push(s_push_probe_header)) {
+        for (unsigned i = 0; i < DBC_HEADER_LEN; i++) {
+            s_cart_push_header[i] = s_push_probe_header[i];
+        }
+        s_cart_push_chk = s_push_probe_chk;
+        s_cart_push_confirmed = true;
+    } else {
+        if (s_read_buf_filled < sizeof(s_read_buf)) {
+            s_read_buf[s_read_buf_filled++] = DBC_SLIP_END;
+        }
+        for (uint16_t i = 0; i < s_push_probe_raw_len && s_read_buf_filled < sizeof(s_read_buf); i++) {
+            s_read_buf[s_read_buf_filled++] = s_push_probe_raw[i];
+        }
+    }
+
+    s_push_probe_state = PUSH_PROBE_IDLE;
+}
+
 // Blocks until the next CS-active address is captured, and returns its
 // demangled logical (byte) address.  Discards captures that fail to
 // demangle (CS glitches etc).
@@ -531,11 +877,41 @@ static uint32_t drivewire_next_addr(void) {
         // request as soon as it parses it, and at 921600 baud its entire
         // 256-byte response can arrive and overrun the 32-byte hardware RX
         // FIFO well before the CoCo even finishes sending the knock that (as
-        // far as this plugin previously knew) starts a read session.
+        // far as this plugin previously knew) starts a read session.  Fed
+        // through drivewire_push_probe_feed() rather than stashed directly,
+        // so a push starting here - mid-write-relay, or while scanning for
+        // the next knock - gets the same chance to be recognized as one
+        // starting right at a read session's own first byte - but only
+        // while s_push_probe_enabled, i.e. only once
+        // drivewire_do_write() has armed it (see that function's own
+        // comment).  Falls back to the plain stash otherwise, exactly as
+        // before any push support existed: confirmed on real hardware that
+        // ordinary sector data can coincidentally pass the full header
+        // check often enough, over a long enough session, to cause real
+        // (and costly - a falsely "confirmed" push blocks real traffic for
+        // seconds) failures if probed unconditionally rather than only
+        // during this bounded, content-armed window.
         if (s_read_buf_filled < sizeof(s_read_buf) &&
             !(UART_REG(DW_UART_BASE, UART_FR_OFFSET) & UART_FR_RXFE)) {
-            s_read_buf[s_read_buf_filled++] =
-                (uint8_t)UART_REG(DW_UART_BASE, UART_DR_OFFSET);
+            uint8_t b = (uint8_t)UART_REG(DW_UART_BASE, UART_DR_OFFSET);
+            if (s_push_probe_enabled) {
+                drivewire_push_probe_feed(b);
+            } else {
+                s_read_buf[s_read_buf_filled++] = b;
+            }
+        }
+
+        // Disarm once the budget runs out with nothing confirmed - never
+        // while mid-probe (s_push_probe_state != PUSH_PROBE_IDLE), so a
+        // candidate header already in progress always gets to resolve
+        // (and, on failure, replay its raw bytes) rather than being
+        // abandoned mid-way with its bytes lost.  A probe is at most
+        // DBC_PROBE_RAW_CAP bytes, a handful of microseconds at 921600
+        // baud, so delaying disarm until it resolves costs nothing
+        // measurable against DW_PUSH_ARM_BUDGET's own multi-second span.
+        if (s_push_probe_enabled && s_push_probe_state == PUSH_PROBE_IDLE &&
+            --s_push_probe_arm_budget == 0u) {
+            s_push_probe_enabled = false;
         }
 
         if (RING_BUF_CUR_READ_INDEX() == RING_BUF_CUR_WRITE_INDEX()) {
@@ -599,18 +975,30 @@ static uint32_t drivewire_test_next_addr(void) {
 // sequences at once.
 static session_dir_t drivewire_wait_for_knock(void) {
     // Deliberately does not touch s_read_buf_filled: drivewire_next_addr()'s
-    // opportunistic drain runs continuously, including during the write
-    // session that precedes a read (e.g. the checksum write ahead of an
-    // ack-read), so the server's reply can already be sitting in s_read_buf
-    // by the time this knock is even seen.  Discarding it here would lose it
-    // permanently - drivewire_do_read() would then block forever on a fresh
-    // UART byte that already came and went.  s_read_buf itself stays
-    // consistent without help: drivewire_do_write() never touches it, and
+    // opportunistic drain runs continuously while this loop does, so the
+    // server's reply can already be sitting in s_read_buf by the time this
+    // knock is even seen.  Discarding it here would lose it permanently -
+    // drivewire_do_read() would then block forever on a fresh UART byte
+    // that already came and went.  s_read_buf itself stays consistent
+    // without help: drivewire_do_write() never touches it, and
     // drivewire_do_read() zeroes the count only once it has consumed exactly
     // that many bytes.
+    //
+    // Cartridge-push detection here is entirely content-armed, not scoped by
+    // this loop at all - see s_push_probe_enabled's own comment for why an
+    // earlier, phase-scoped design (on for the duration of this loop,
+    // unconditionally) still exposed the bulk of every ordinary sector
+    // reply and had to be replaced.  drivewire_next_addr() below still
+    // opportunistically drains UART1 either way; it is only the decision of
+    // whether to engage drivewire_push_probe_feed() on what it drains that
+    // depends on whether drivewire_do_write() has armed it.
     uint8_t window[KNOCK_LEN] = {0};
+    session_dir_t result;
     for (;;) {
         uint8_t b = (uint8_t)(drivewire_next_addr() & 0xFFu);
+        if (s_cart_push_confirmed) {
+            drivewire_receive_confirmed_push();
+        }
         for (unsigned i = 0; i < KNOCK_LEN - 1u; i++) {
             window[i] = window[i + 1u];
         }
@@ -622,6 +1010,19 @@ static session_dir_t drivewire_wait_for_knock(void) {
             if (window[i] != s_knock_read[i])  match_read = false;
             if (window[i] != s_knock_cart[i])  match_cart = false;
         }
+        // match_cart acks here too, alongside match_write. A prior attempt
+        // to narrow this to match_write only - on the theory that a
+        // "!LDCART!" caller could mistake the knock-landed ack for the
+        // load-complete one, since both are the same value at the same
+        // address - was A/B tested on real hardware (2026-10-13) and
+        // confirmed to cause checksum/opcode corruption on ordinary,
+        // non-cart traffic, by a mechanism not fully traced. The theoretical
+        // race it targeted is also not confirmed to be real: the incident
+        // that motivated it turned out to be a config app that never sent
+        // "!LDCART!" at all, and drivewire_do_load_cart() already clears
+        // this ack again as its first action, within microseconds given the
+        // ~100x clock speed gap to a 6809 - too narrow a window for that
+        // caller to plausibly observe. Keep acking both here.
         if (match_write || match_cart) {
             // Acknowledge as fast as possible - dwonewrite.asm's DWWrite,
             // and a "!LDCART!" caller doing the same thing, poll
@@ -635,10 +1036,11 @@ static session_dir_t drivewire_wait_for_knock(void) {
             uint8_t ack = DW_KNOCK_ACK_VALUE;
             s_reprogram(s_active_slot, DW_KNOCK_ACK_ADDR, &ack, 1u, 1u);
         }
-        if (match_write) return SESSION_WRITE;
-        if (match_read)  return SESSION_READ;
-        if (match_cart)  return SESSION_LOAD_CART;
+        if (match_write) { result = SESSION_WRITE; break; }
+        if (match_read)  { result = SESSION_READ; break; }
+        if (match_cart)  { result = SESSION_LOAD_CART; break; }
     }
+    return result;
 }
 #endif // !DRIVEWIRE_TEST_PATTERN
 
@@ -670,10 +1072,51 @@ static uint32_t drivewire_next_addr_skip_ack(void) {
 // Sessions
 // ---------------------------------------------------------------------------
 
+// Defined with the rest of the DBC machinery, below - forward-declared here
+// since drivewire_do_read() is the one place that calls it, right at the
+// point a cartridge push can legally begin.
+static void drivewire_resolve_pushed_cart(void);
+
 static void drivewire_do_write(uint16_t count) {
     uint16_t checksum = 0;
+    uint8_t first_byte = 0;
     for (uint16_t i = 0; i < count; i++) {
         uint8_t b = (uint8_t)(drivewire_next_addr() & 0xFFu);
+        if (i == 0) {
+            first_byte = b;
+        } else if (i == 1 && first_byte == FUJI_OP_FUJI &&
+                   (b == FUJI_CMD_MOUNT_IMAGE || b == FUJI_CMD_MOUNT_ALL)) {
+            // Arms cartridge-push detection on recognizing a ROM-mount-
+            // triggering write, content-based rather than scoped by session
+            // phase - see s_push_probe_enabled's own comment for why phase
+            // scoping wasn't safe.  Checking only the first two relayed
+            // bytes is deliberate: this is the exact wire prefix
+            // fuji_mount_disk_image()/fuji_mount_all() (fujinet-lib) send,
+            // and checking no more than that keeps this cheap on every
+            // write, not just ones that turn out to match.  Not every mount
+            // this arms for actually pushes anything (FUJICMD_MOUNT_IMAGE
+            // mounts an ordinary .dsk far more often than a ROM, and
+            // FUJICMD_MOUNT_ALL fires at every boot restoring whatever
+            // disks were previously configured, not just when a ROM is
+            // involved), so most arm windows simply expire with
+            // s_push_probe_arm_budget reaching 0 and nothing confirmed - a
+            // deliberate, accepted cost, far cheaper than being armed
+            // unconditionally.  2026-10-10: confirmed on real hardware that
+            // arming on its own was not sufficient - FUJICMD_MOUNT_ALL's
+            // own every-boot firing meant the arm window routinely
+            // overlapped with the heavy burst of ordinary sector reads that
+            // naturally follows any mount, reopening the same false-positive
+            // exposure at a lower frequency.  dbc_header_looks_like_push()
+            // was tightened in response (NET_OPEN specifically, a narrow
+            // claimed length) rather than narrowing which commands arm here
+            // - both FUJICMD_MOUNT_IMAGE and FUJICMD_MOUNT_ALL are
+            // genuine, ESP32-confirmed push triggers (see
+            // fujicmd_mount_disk_image_success()/fujicmd_mount_all_success()
+            // in centi-fuji's drivewireFuji.cpp), so excluding either here
+            // would just trade a false positive for a missed real push.
+            s_push_probe_enabled = true;
+            s_push_probe_arm_budget = DW_PUSH_ARM_BUDGET;
+        }
         if (i < DEBUG_WRITE_BYTES) {
             s_debug_write_bytes[i] = b;
         }
@@ -688,9 +1131,54 @@ static void drivewire_do_write(uint16_t count) {
     // session's own knock, and a write session never touches
     // DW_STATUS_ADDR/DW_DATA_ADDR at all, so only this one address needs it.
     s_reprogram(s_active_slot, DW_KNOCK_ACK_ADDR, &s_orig_ack_byte, 1u, 1u);
+
+    // Checked only now, after this write's own bytes are all sent - not
+    // per-iteration above, which would risk pausing mid-relay to receive a
+    // push and starving the ring buffer of this write's own remaining,
+    // non-redundant bytes.  By this point the CoCo has nothing further to
+    // send for this session, so pausing here costs nothing - see
+    // drivewire_receive_confirmed_push()'s own comment.  This is a flag
+    // check, not a wait: drivewire_push_probe_feed() (fed from
+    // drivewire_next_addr()'s own opportunistic drain, which every call
+    // above already went through) is what actually notices a push, and it
+    // never blocks either - see its own comment.  Relevant here because a
+    // push can be confirmed mid-relay of a write that is itself unrelated
+    // to any mount - e.g. the CoCo-side bus_ready()/fuji_get_error() dance
+    // that follows a mount write (see the "DBC (FujiBusPacket)" section's
+    // own history of this).
+    if (s_cart_push_confirmed) {
+        drivewire_receive_confirmed_push();
+    }
 }
 
 static void drivewire_do_read(uint16_t count) {
+    // Before accepting this session's own first real reply byte, repeatedly
+    // watch for (and fully consume) an unprompted cartridge push, but only
+    // while s_push_probe_enabled (see drivewire_do_write()'s own comment
+    // for what arms it, and drivewire_resolve_pushed_cart()'s for why this
+    // function needs its own check rather than relying on
+    // drivewire_push_probe_feed()).  The common case - not armed - costs
+    // nothing extra: the condition short-circuits before ever touching
+    // UART1 here.  Skipped even while armed once s_read_buf_filled is
+    // already nonzero: that only happens when drivewire_next_addr()'s own
+    // opportunistic drain (see its own comment) has already pulled in real
+    // reply bytes before this session's knock was even seen, which means
+    // the real reply has already started - and by design (the ESP32
+    // finishes pushing before it ever replies), a push never starts
+    // arriving after its own reply has begun.
+    while (s_push_probe_enabled && s_read_buf_filled == 0u && count > 0u) {
+        uint8_t b;
+        if (!drivewire_uart_getc(&b)) {
+            s_err_log("DriveWire: timed out waiting for UART1 RX, aborting session");
+            return;
+        }
+        if (b != DBC_SLIP_END) {
+            s_read_buf[s_read_buf_filled++] = b;
+            break;
+        }
+        drivewire_resolve_pushed_cart();
+    }
+
     // Finish draining the whole response from UART1 before any of the CoCo
     // handshake below - drivewire_next_addr() may already have opportunistically
     // pre-drained some of it into s_read_buf while this session's knock was
@@ -779,57 +1267,92 @@ static void drivewire_do_read(uint16_t count) {
 }
 
 // ---------------------------------------------------------------------------
-// DBC (FujiBusPacket) - "!LDCART!" only
+// DBC (FujiBusPacket) - cartridge pushes and "!LDCART!"
 // ---------------------------------------------------------------------------
 //
-// A "!LDCART!" knock doesn't stream the cartridge image off the ROM bus
-// itself (the CoCo has nothing left to do but poll for the completion ack -
-// see drivewire_do_load_cart()'s own comment).  Instead, this plugin asks the
-// FujiNet ESP32 - over UART1, same wire as ordinary DriveWire traffic - to
-// push device slot 0's already-mounted ROM image directly, using the same
+// FujiNet pushes a mounted ROM image unprompted, over UART1 - same wire as
+// ordinary DriveWire traffic - the moment it has one to send, using the same
 // SLIP-framed "DBC" side channel FujiNet's `fujiversal`/`COCO_HS_UART`
 // firmware already speaks to a pico-class companion elsewhere (see
-// lib/media/drivewire/mediaTypeROM.cpp's push_stream() and
+// lib/device/drivewire/disk.cpp's push_rom_image() and
 // lib/bus/rs232/FujiBusPacket.cpp in that tree for the authoritative wire
-// format this mirrors).  The request that triggers the push
-// (OP_FUJI/FUJI_PULL_ROM below) is a plain, unframed DriveWire opcode - SLIP
-// framing is only ever used for the DBC exchange that follows it, never for
-// this plugin's own request.
+// format this mirrors - not lib/device/rs232/disk.cpp's own, differently-named
+// push_stream(), which belongs to an unrelated device).  This plugin never
+// asks for it: there is no request of its own on the wire, matching
+// fujiversal's own auto-push-on-mount model rather than an on-demand pull.
 //
-// This works with zero opportunistic-drain interference from
-// drivewire_next_addr() (which siphons UART1 bytes into s_read_buf on every
-// call, for the unrelated ordinary-read-session pre-fetch): this whole
-// exchange runs from inside drivewire_do_load_cart(), which never calls
-// drivewire_next_addr() at all, only drivewire_uart_getc()/drivewire_uart_putc()
-// directly.  Nothing else is using UART1 at this point - the CoCo is just
-// spin-polling DW_KNOCK_ACK_ADDR - so there is no live DriveWire transaction
-// for these frames to arrive in the middle of, unlike the mid-mailbox-
-// transaction case FujiNet's own Intellivision port has to handle.
-#define DBC_SLIP_END       0xC0u
-#define DBC_SLIP_ESC       0xDBu
-#define DBC_SLIP_ESC_END   0xDCu
-#define DBC_SLIP_ESC_ESC   0xDDu
-
-#define DBC_FUJI_DEVICEID  0xFFu
-#define DBC_CMD_NET_OPEN   0x4Fu
-#define DBC_CMD_NET_WRITE  0x57u
-#define DBC_CMD_NET_CLOSE  0x43u
-#define DBC_CMD_FUJI_ACK   0x06u
-#define DBC_CMD_FUJI_NAK   0x15u
-
-#define DBC_HEADER_LEN     6u   // device, command, length(lo,hi), checksum, descr
-
-#define FUJI_OP_FUJI       0xE2u  // matches dw.h's OP_FUJI - see fuji_mount_host_slot.c
-#define FUJI_CMD_PULL_ROM  0xECu  // matches centi-fuji's CMD::FUJI_PULL_ROM
-
-// Folds one more byte into a running checksum - matches FujiBusPacket's
-// calcChecksum() exactly (an 8-bit add-with-end-around-carry), which stays a
-// clean 0-255 value after every call since the largest possible pre-fold sum
-// is 255+255.
-static uint8_t dbc_checksum_add(uint8_t chk, uint8_t b) {
-    uint16_t sum = (uint16_t)chk + b;
-    return (uint8_t)((sum >> 8) + (sum & 0xFFu));
-}
+// The gap between the write session that triggers a mount and the push that
+// follows is NOT a fixed, short one: on real hardware it has been observed
+// to run past 450ms (FujiNet's own mount+push processing, e.g. an SD card
+// file open), so there is no sensibly-bounded timeout that could watch for
+// it at any one single point.  Worse, that gap is not even one uninterrupted
+// wait from this plugin's own perspective: the CoCo-side client code that
+// triggers a mount (traced to fujinet-lib's fuji_mount_disk_image(),
+// fuji_get_error() and bus_ready()) interleaves further small write/read
+// pairs of its own (a status query, an error check, each wrapped in its own
+// ready-retry loop) before ever reading the data a push precedes - so a
+// push's own leading DBC_SLIP_END can legally arrive while this plugin is
+// in the middle of relaying a *different*, unrelated write's bytes, not
+// just while idly scanning for the next knock.
+//
+// Two earlier designs both failed on real hardware before landing on this
+// one. First, detection ran unconditionally on every byte, everywhere
+// drivewire_next_addr() is called, plus a separate check at the start of
+// every drivewire_do_read() session, on the theory that
+// dbc_header_looks_like_push()'s own four-field check made a false positive
+// on ordinary data astronomically unlikely. Confirmed wrong in practice:
+// disk sector data is not random (it's a compiled program and filesystem
+// structure), and a false positive is not cheap - it blocks real DriveWire
+// traffic for seconds while this plugin waits on a push that was never
+// coming. Narrowing detection to run only during drivewire_wait_for_knock()'s
+// own scan (the second design) didn't actually reduce that exposure either:
+// that scan's own opportunistic drain is *exactly* the mechanism that
+// catches a fast-arriving reply before its own read knock is even sent,
+// which is the common case for ordinary sector data, not a rare one - so a
+// false positive there blocked drivewire_wait_for_knock() itself, the one
+// function responsible for ever recognizing the next knock at all, and no
+// DriveWire traffic got through from the very first session onward.
+//
+// Detection is therefore content-armed instead of phase-scoped:
+// drivewire_do_write() arms it (sets s_push_probe_enabled, see its own
+// comment) only on recognizing a write that starts with the OP_FUJI/
+// FUJICMD_MOUNT_IMAGE or FUJICMD_MOUNT_ALL opcode bytes - the only writes
+// that can ever cause FujiNet to push a ROM image in the first place.
+// Ordinary disk I/O (the vast majority of all traffic) never arms it at
+// all, so the false-positive exposure that broke the first two designs
+// simply never applies to it. Once armed, drivewire_push_probe_feed() (fed
+// from drivewire_next_addr()'s own opportunistic drain) runs from inside
+// both drivewire_wait_for_knock()'s knock-scan and drivewire_do_write()'s
+// own relay loop, and drivewire_resolve_pushed_cart() additionally covers
+// drivewire_do_read()'s own drivewire_uart_getc() loop, which bypasses
+// drivewire_next_addr() entirely - between the three, a push is caught
+// regardless of which of those three the CoCo-side bus_ready()/
+// fuji_get_error() dance (see DW_PUSH_ARM_BUDGET's own comment) happens to
+// have this plugin inside of when it actually starts arriving.
+// s_push_probe_arm_budget bounds how long an arm window stays open with
+// nothing confirmed, extended on every successful receive in case
+// FUJICMD_MOUNT_ALL pushes more than one slot.
+//
+// dbc_header_looks_like_push() is what tells a real push apart from an
+// ordinary reply that merely happens to start with the same byte value -
+// see its own comment for why a marker byte alone is not trustworthy and
+// the whole header has to check out first.  A false alarm's raw bytes are
+// replayed into s_read_buf verbatim rather than discarded.  Once a push is
+// confirmed, the exchange is fully committed and nothing else touches
+// UART1 until it ends (dbc_recv_frame()/dbc_send_frame() use
+// drivewire_uart_getc()/drivewire_uart_putc() directly, never
+// drivewire_next_addr()'s own opportunistic drain), so there is no live
+// DriveWire transaction for these frames to arrive in the middle of, unlike
+// the mid-mailbox-transaction case FujiNet's own Intellivision port has to
+// handle.
+//
+// "!LDCART!" never triggers or receives any of this itself - it only checks
+// s_cart_pending and, if a push has already landed, activates it.  See
+// drivewire_do_load_cart()'s own comment.  See the "Protocol constants"
+// section above for the DBC_*/FUJI_OP_FUJI/FUJI_CMD_MOUNT_* byte values and
+// DW_PUSH_ARM_BUDGET used throughout, and the "DBC (FujiBusPacket) helpers"
+// section (also above) for dbc_checksum_add() and dbc_header_looks_like_push(),
+// hoisted up there for drivewire_next_addr()'s own use.
 
 // Sends one bare (no params, no payload) SLIP-framed DBC header - only ever
 // used here for our own ACK/NAK replies, mirroring FujiNet's own
@@ -865,22 +1388,97 @@ static void dbc_send_frame(uint8_t command) {
     drivewire_uart_putc(DBC_SLIP_END);
 }
 
-// Reads and validates exactly one SLIP-framed DBC packet from UART1, timing
-// out (see drivewire_uart_getc()) rather than blocking forever if the ESP32
-// stops responding mid-exchange.  Any payload beyond the 6-byte header
-// streams directly into s_read_buf, reused here purely as scratch space -
-// nothing else needs it during a "!LDCART!" load, and it is already sized
-// to fit push_stream()'s own 256-byte (MEDIA_BLOCK_SIZE) NET_WRITE chunks
-// exactly.  This plugin never sends packed params of its own and FujiNet's
-// push_stream() never does either (its payloads always travel as a raw
-// FujiBusPacket _data blob, not as descriptor-packed params), so descr is
-// always 0 here and everything past the header is unconditionally payload -
-// no descriptor/param parsing to implement.
-static bool dbc_recv_frame(uint8_t *device, uint8_t *command, uint16_t *payload_len) {
-    enum { WAIT_START, IN_FRAME, IN_ESCAPE } state = WAIT_START;
-    uint8_t header[DBC_HEADER_LEN];
+// Decodes exactly DBC_HEADER_LEN logical bytes of a SLIP-framed DBC header
+// from UART1, given the caller has already consumed the frame's own leading
+// DBC_SLIP_END.  Unlike dbc_recv_frame_payload() below, this always reports
+// the *raw*, still-SLIP-encoded bytes it consumed getting there (into raw,
+// capped at raw_cap) - drivewire_resolve_pushed_cart() needs those to
+// replay verbatim into s_read_buf if they turn out not to belong to a real
+// push after all (see its own comment for why a header full of plausible
+// field values is still not proof enough on its own).  Pass raw=NULL to skip
+// that capture, for dbc_recv_frame()'s own use below, where nothing needs
+// replaying - by the time it is scanning for a second or later frame, a push
+// is already confirmed under way and nothing else is sharing the wire.
+//
+// Returns false on a timeout or a frame that ends (another DBC_SLIP_END)
+// before a full header is decoded - raw/raw_len are valid either way, since
+// even a failed probe's bytes must still be replayable.  *chk_out holds the
+// running checksum over the decoded header (its own checksum field
+// contributing 0, matching the sender zeroing it out before computing its
+// own), for dbc_recv_frame_payload() to continue accumulating.
+static bool dbc_decode_header_probe(uint8_t header[DBC_HEADER_LEN], uint8_t *chk_out,
+                                     uint8_t *raw, uint16_t *raw_len, uint16_t raw_cap) {
+    enum { IN_FRAME, IN_ESCAPE } state = IN_FRAME;
     uint16_t decoded_len = 0;
     uint8_t chk = 0;
+    *raw_len = 0;
+
+    while (decoded_len < DBC_HEADER_LEN) {
+        uint8_t b;
+        if (!drivewire_uart_getc(&b)) {
+            return false;
+        }
+        if (raw != NULL && *raw_len < raw_cap) {
+            raw[(*raw_len)++] = b;
+        }
+
+        bool have_byte = false;
+        uint8_t decoded_byte = 0;
+
+        if (state == IN_ESCAPE) {
+            state = IN_FRAME;
+            if (b == DBC_SLIP_ESC_END) { decoded_byte = DBC_SLIP_END; have_byte = true; }
+            else if (b == DBC_SLIP_ESC_ESC) { decoded_byte = DBC_SLIP_ESC; have_byte = true; }
+            // else: malformed escape - abort rather than leniently dropping
+            // it and continuing (unlike dbc_recv_frame_payload()'s own
+            // leniency, mirroring decodeSLIP(), once a push is already
+            // confirmed).  A real DBC sender never emits an invalid escape
+            // pair, so this is itself proof this isn't one.
+            else { return false; }
+        } else if (b == DBC_SLIP_END) {
+            if (decoded_len != 0) {
+                return false;  // frame ended before a full header - not real
+            }
+            // else: this was just the frame's own opening marker, repeated
+        } else if (b == DBC_SLIP_ESC) {
+            state = IN_ESCAPE;
+        } else {
+            decoded_byte = b;
+            have_byte = true;
+        }
+
+        if (have_byte) {
+            header[decoded_len] = decoded_byte;
+            chk = dbc_checksum_add(chk, decoded_len == 4u ? 0u : decoded_byte);
+            decoded_len++;
+        }
+    }
+
+    *chk_out = chk;
+    return true;
+}
+
+// Reads and validates a DBC frame's payload and trailing checksum, given its
+// header has already been decoded (dbc_decode_header_probe() above) and chk
+// is the running checksum over that header.  Any payload streams directly
+// into s_read_buf, reused here purely as scratch space - nothing else needs
+// it while a cartridge push is being received, and it is already sized to
+// fit push_rom_image()'s own 256-byte (MEDIA_BLOCK_SIZE) NET_WRITE chunks
+// exactly.  This plugin never attempts to interpret FujiBusPacket's own
+// descriptor-packed-params encoding (descr is NOT always 0 on the wire -
+// push_rom_image()'s own NET_OPEN frame sends one packed 2-byte param, descr
+// 0x05, not a raw payload - see dbc_header_looks_like_push()'s own comment
+// for the full trace) - it doesn't need to: whatever bytes follow the
+// header, packed param or raw data alike, land in the same place on the
+// wire, so treating all of it uniformly as unconditional payload - no
+// descriptor/param parsing to implement - works regardless of which one a
+// given frame actually is.  Times out (see
+// drivewire_uart_getc()) rather than blocking forever if the ESP32 stops
+// responding mid-exchange.
+static bool dbc_recv_frame_payload(const uint8_t header[DBC_HEADER_LEN], uint8_t chk,
+                                    uint8_t *device, uint8_t *command, uint16_t *payload_len) {
+    enum { IN_FRAME, IN_ESCAPE } state = IN_FRAME;
+    uint16_t decoded_len = DBC_HEADER_LEN;
     bool frame_complete = false;
 
     while (!frame_complete) {
@@ -892,59 +1490,33 @@ static bool dbc_recv_frame(uint8_t *device, uint8_t *command, uint16_t *payload_
         bool have_byte = false;
         uint8_t decoded_byte = 0;
 
-        switch (state) {
-        case WAIT_START:
-            if (b == DBC_SLIP_END) {
-                state = IN_FRAME;
-                decoded_len = 0;
-                chk = 0;
-            }
-            break;
-
-        case IN_ESCAPE:
+        if (state == IN_ESCAPE) {
             state = IN_FRAME;
             if (b == DBC_SLIP_ESC_END) { decoded_byte = DBC_SLIP_END; have_byte = true; }
             else if (b == DBC_SLIP_ESC_ESC) { decoded_byte = DBC_SLIP_ESC; have_byte = true; }
             // else: malformed escape - drop it, matching decodeSLIP()'s own leniency
-            break;
-
-        default:  // IN_FRAME
-            if (b == DBC_SLIP_END) {
-                if (decoded_len != 0) {
-                    frame_complete = true;
-                }
-                // else: this was just the frame's own opening marker
-            } else if (b == DBC_SLIP_ESC) {
-                state = IN_ESCAPE;
-            } else {
-                decoded_byte = b;
-                have_byte = true;
-            }
-            break;
+        } else if (b == DBC_SLIP_END) {
+            frame_complete = true;  // decoded_len is always != 0 here
+        } else if (b == DBC_SLIP_ESC) {
+            state = IN_ESCAPE;
+        } else {
+            decoded_byte = b;
+            have_byte = true;
         }
 
         if (have_byte) {
-            if (decoded_len < DBC_HEADER_LEN) {
-                header[decoded_len] = decoded_byte;
-                // The checksum field itself contributes 0, not its
-                // transmitted value - matching the sender zeroing it out
-                // before computing its own checksum.
-                chk = dbc_checksum_add(chk, decoded_len == 4u ? 0u : decoded_byte);
-            } else if ((decoded_len - DBC_HEADER_LEN) < sizeof(s_read_buf)) {
+            if ((decoded_len - DBC_HEADER_LEN) < sizeof(s_read_buf)) {
                 s_read_buf[decoded_len - DBC_HEADER_LEN] = decoded_byte;
-                chk = dbc_checksum_add(chk, decoded_byte);
             }
             // else: payload longer than s_read_buf can hold - should never
             // happen (see this function's own comment); the length/checksum
             // check below catches it rather than silently accepting a
             // truncated payload.
+            chk = dbc_checksum_add(chk, decoded_byte);
             decoded_len++;
         }
     }
 
-    if (decoded_len < DBC_HEADER_LEN) {
-        return false;
-    }
     uint16_t claimed_len = (uint16_t)header[2] | ((uint16_t)header[3] << 8);
     if (claimed_len != decoded_len || chk != header[4]) {
         return false;
@@ -956,16 +1528,259 @@ static bool dbc_recv_frame(uint8_t *device, uint8_t *command, uint16_t *payload_
     return true;
 }
 
-// Handles a "!LDCART!" session end to end: asks FujiNet to push device slot
-// 0's mounted ROM image via DBC straight into DW_CART_RAM_SLOT (never
-// s_active_slot - see that macro's own comment), then, if it all arrived and
-// fit, atomically switches to it.  Not part of DriveWire proper - a
-// One-ROM-specific extension the config app speaks directly (see
+// Scans for the next frame's own leading DBC_SLIP_END, then decodes it in
+// full.  Only used once a push is already underway
+// (drivewire_dbc_receive_cart()'s own loop, fetching its second and later
+// frames) - the very first frame is always told apart from an ordinary
+// reply's first byte by one of drivewire_push_probe_feed() or
+// drivewire_resolve_pushed_cart() instead (see the "DBC (FujiBusPacket)"
+// section header comment above for which covers what), both of which
+// additionally validate the header's own fields before trusting it (see
+// dbc_header_looks_like_push()'s own comment for why the marker byte alone
+// is not enough).
+static bool dbc_recv_frame(uint8_t *device, uint8_t *command, uint16_t *payload_len) {
+    uint8_t b;
+    do {
+        if (!drivewire_uart_getc(&b)) {
+            return false;
+        }
+    } while (b != DBC_SLIP_END);
+
+    uint8_t header[DBC_HEADER_LEN];
+    uint8_t chk;
+    uint16_t raw_len;
+    if (!dbc_decode_header_probe(header, &chk, NULL, &raw_len, 0)) {
+        return false;
+    }
+    return dbc_recv_frame_payload(header, chk, device, command, payload_len);
+}
+
+// Runs the NET_OPEN/NET_WRITE.../NET_CLOSE loop that receives a pushed
+// cartridge image into DW_CART_RAM_SLOT (never s_active_slot - see that
+// macro's own comment), given the first frame's header has already been
+// decoded by the caller.  Sets s_cart_pending on a complete, well-formed
+// transfer; DW_CART_RAM_SLOT's contents are undefined on failure, matching
+// "nothing has been activated" the same way a failed "!LDCART!" load used to
+// promise.
+static bool drivewire_dbc_receive_cart(uint8_t device, uint8_t command, uint16_t payload_len) {
+    uint32_t slot_size = 0;
+    ora_result_t size_rc = s_get_ram_slot_info(DW_CART_RAM_SLOT, NULL, &slot_size, NULL);
+    // Everything below is bounded by the chip's addressable window, never
+    // slot_size - see s_cart_window_size's own comment.
+    uint32_t window_size = s_cart_window_size;
+
+    uint32_t offset = 0;
+    for (;;) {
+        if (device != DBC_FUJI_DEVICEID) {
+            s_err_log("DriveWire: cartridge push: unexpected DBC device");
+            return false;
+        }
+
+        if (command == DBC_CMD_NET_OPEN) {
+            // Carries no image size at all - verified against
+            // FujiBusPacket::serialize(): push_rom_image()'s NET_OPEN is a
+            // single packed 2-byte parameter, always the literal value 0,
+            // not a raw payload (see dbc_header_looks_like_push()'s own
+            // comment for the full wire-format trace).  An earlier version
+            // of this code assumed a 4-byte size followed a 1-byte stream
+            // id here - wrong, and the reason every push attempt failed at
+            // NET_OPEN for the entire time that assumption stood: the real
+            // frame's own descr/length never matched what
+            // dbc_header_looks_like_push() was checking for.  With no size
+            // to validate against window_size up front, this only confirms
+            // the slot and window themselves are valid; DBC_CMD_NET_WRITE
+            // below bounds the actual transfer as data arrives, which is the
+            // only point a real size ever becomes known.
+            offset = 0;
+            s_cart_received_checksum = 0;
+            bool slot_ok = (size_rc == ORA_RESULT_OK &&
+                            window_size != 0u && window_size <= slot_size);
+            dbc_send_frame(slot_ok ? DBC_CMD_FUJI_ACK : DBC_CMD_FUJI_NAK);
+            if (!slot_ok) {
+                s_err_log("DriveWire: cartridge push: slot %u size unavailable",
+                          (unsigned)DW_CART_RAM_SLOT);
+                return false;
+            }
+        } else if (command == DBC_CMD_NET_WRITE) {
+            if (offset + payload_len > window_size) {
+                s_err_log("DriveWire: cartridge image exceeds the %u-byte chip window",
+                          (unsigned)window_size);
+                dbc_send_frame(DBC_CMD_FUJI_NAK);
+                return false;
+            }
+            for (uint16_t i = 0; i < payload_len; i++, offset++) {
+                s_reprogram(DW_CART_RAM_SLOT, offset, &s_read_buf[i], 1u, 0u);
+                // Plain sum, matching FujiNet's own
+                // drivewire_checksum() exactly (see dwload_cmoc.c's copy of
+                // it), so fujinet-config can recompute the same value.
+                // Capped at the absolute $C000+0x3F00 (=$FF00) boundary -
+                // every CoCo decodes that as real I/O regardless of image
+                // size, so bytes past it are never ROM-bus-readable and
+                // would make this incomparable to the CoCo's own (equally
+                // capped) checksum.
+                if (offset < 0x3F00u) {
+                    s_cart_received_checksum = (uint16_t)(s_cart_received_checksum + s_read_buf[i]);
+                }
+            }
+            dbc_send_frame(DBC_CMD_FUJI_ACK);
+        } else if (command == DBC_CMD_NET_CLOSE) {
+            // Abort-CLOSE (payload 0x01): FujiNet gave up mid-stream - unwedge
+            // without activating partial data.  Bare CLOSE = a complete transfer.
+            bool aborted = (payload_len > 0u && s_read_buf[0] == 0x01u);
+            dbc_send_frame(DBC_CMD_FUJI_ACK);
+            if (aborted) {
+                return false;
+            }
+            s_cart_received_len = (uint16_t)offset;
+
+            // A real EPROM smaller than this emulation's full address
+            // window (e.g. a 4K/8K chip on a profile that decodes the
+            // full 16K) leaves its own upper address lines unconnected,
+            // so its content repeats every <image size> bytes across the
+            // whole window - any access past the image's own end reads a
+            // wrapped copy of the start on real hardware, not open bus or
+            // whatever a previous push happened to leave there. Mirror
+            // the just-received image across the rest of the slot the
+            // same way. Read back from the slot itself (not s_read_buf,
+            // which only ever holds the most recent network frame) in
+            // chunks clipped to the image's own end, so each chunk's
+            // source bytes are always ones that have already landed.
+            if (offset > 0 && offset < window_size) {
+                uint32_t dst = offset;
+                while (dst < window_size) {
+                    uint32_t src_off = dst % offset;
+                    uint32_t chunk = window_size - dst;
+                    uint32_t avail = offset - src_off;
+                    if (chunk > avail) chunk = avail;
+                    if (chunk > sizeof(s_read_buf)) chunk = sizeof(s_read_buf);
+                    if (s_read_slot(DW_CART_RAM_SLOT, src_off, s_read_buf, chunk) != ORA_RESULT_OK)
+                        break;
+                    if (s_reprogram(DW_CART_RAM_SLOT, dst, s_read_buf, chunk, 0u) != ORA_RESULT_OK)
+                        break;
+                    dst += chunk;
+                }
+            }
+
+            s_cart_pending = true;
+            return true;
+        } else {
+            dbc_send_frame(DBC_CMD_FUJI_NAK);
+        }
+
+        if (!dbc_recv_frame(&device, &command, &payload_len)) {
+            s_err_log("DriveWire: cartridge push: DBC frame timed out or malformed");
+            return false;
+        }
+    }
+}
+
+// Called from drivewire_do_read(), having already consumed a DBC_SLIP_END as
+// the very first byte of what might be an unprompted cartridge push, only
+// while s_push_probe_enabled (see that function's own comment and
+// drivewire_do_write()'s for what arms it).  This covers the one gap
+// drivewire_push_probe_feed() can't: drivewire_do_read()'s own
+// drivewire_uart_getc() loop bypasses drivewire_next_addr() entirely, so a
+// push arriving right as this exact read session begins - e.g. the mount's
+// own "real" reply, which the CoCo-side bus_ready()/fuji_get_error() dance
+// means is not necessarily the very next read after the triggering write -
+// would otherwise go unnoticed here.
+//
+// A single DBC_SLIP_END byte is NOT enough on its own to conclude a push is
+// starting, even while armed: it is the server's genuine first reply byte
+// for an ordinary, non-push transaction too, and any byte value can appear
+// there by sheer coincidence of whatever data the reply happens to carry
+// (confirmed on real hardware, before arming existed at all: a CRC error
+// reading one specific disk block, every time, traced to that block's own
+// data producing a stray $C0 here).  So this goes on to probe the rest of
+// the header - device, command, descr and a sane length - before ever
+// treating those bytes as spent on a push rather than real reply data.
+// dbc_decode_header_probe() captures every raw byte it consumes doing this;
+// if the header doesn't hold up, this replays them - the leading
+// DBC_SLIP_END included - into s_read_buf verbatim, exactly as
+// drivewire_next_addr()'s opportunistic drain would have delivered them, so
+// a false alarm costs nothing and loses no data: drivewire_do_read()'s own
+// retry loop sees s_read_buf_filled become nonzero and falls through to
+// treating everything from there on as the real reply.  Only once the
+// header's fields all check out does this commit to receiving an actual
+// push via drivewire_dbc_receive_cart(), leaving s_read_buf_filled at 0 so
+// that same retry loop keeps watching - either for another push, or for the
+// real reply that follows it.
+static void drivewire_resolve_pushed_cart(void) {
+    uint8_t header[DBC_HEADER_LEN];
+    uint8_t chk;
+    uint8_t raw[DBC_PROBE_RAW_CAP];
+    uint16_t raw_len;
+    bool header_ok = dbc_decode_header_probe(header, &chk, raw, &raw_len, sizeof(raw));
+
+    if (!header_ok || !dbc_header_looks_like_push(header)) {
+        if (s_read_buf_filled < sizeof(s_read_buf)) {
+            s_read_buf[s_read_buf_filled++] = DBC_SLIP_END;
+        }
+        for (uint16_t i = 0; i < raw_len && s_read_buf_filled < sizeof(s_read_buf); i++) {
+            s_read_buf[s_read_buf_filled++] = raw[i];
+        }
+        return;
+    }
+
+    uint8_t device, command;
+    uint16_t payload_len;
+    if (!dbc_recv_frame_payload(header, chk, &device, &command, &payload_len)) {
+        s_err_log("DriveWire: cartridge push: DBC frame timed out or malformed");
+        return;  // s_read_buf_filled stays 0 - drivewire_do_read()'s retry
+                 // loop will try again, treating whatever comes next as a
+                 // fresh attempt.
+    }
+    drivewire_dbc_receive_cart(device, command, payload_len);
+    s_push_probe_arm_budget = DW_PUSH_ARM_BUDGET;  // extend the window - see
+                                                    // drivewire_receive_confirmed_push()'s
+                                                    // own comment.
+}
+
+// Called by drivewire_wait_for_knock()/drivewire_do_write() the moment
+// either notices s_cart_push_confirmed.  drivewire_push_probe_feed()
+// already validated the header's own fields by the time either runs, so
+// there is no "turned out not to be a push" path left to handle here.
+//
+// Safe to block inside dbc_recv_frame_payload()/drivewire_dbc_receive_cart()
+// here specifically because of which two places call this: the CoCo is
+// either redundantly spin-polling an address that has nothing to do with
+// this (drivewire_wait_for_knock(), mid-knock-scan) or has already finished
+// sending everything it's going to send for the current write before this
+// runs (drivewire_do_write(), checked only after its own relay loop
+// completes) - never mid-relay of a write's own time-sensitive bytes, which
+// is the one context this plugin cannot afford to stall.
+static void drivewire_receive_confirmed_push(void) {
+    s_cart_push_confirmed = false;
+
+    uint8_t device, command;
+    uint16_t payload_len;
+    if (!dbc_recv_frame_payload(s_cart_push_header, s_cart_push_chk,
+                                 &device, &command, &payload_len)) {
+        s_err_log("DriveWire: cartridge push: DBC frame timed out or malformed");
+        return;
+    }
+    drivewire_dbc_receive_cart(device, command, payload_len);
+    // Extend the arm window rather than letting it merely run its course -
+    // FUJICMD_MOUNT_ALL can push more than one slot in sequence, and each
+    // push's own completion is otherwise indistinguishable from "nothing
+    // more is coming" until the budget would have run out anyway.
+    s_push_probe_arm_budget = DW_PUSH_ARM_BUDGET;
+}
+
+// Handles a "!LDCART!" knock: if drivewire_receive_confirmed_push()/
+// drivewire_dbc_receive_cart() have already landed a complete cartridge
+// image in DW_CART_RAM_SLOT, atomically activates it; otherwise fails
+// exactly as "no One ROM present" always has.  Not part of DriveWire proper
+// - a One-ROM-specific extension the config app speaks directly (see
 // s_knock_cart's own comment) to transiently boot a user-chosen cartridge
-// image.  The caller is expected to jump to $C000 once it sees the
-// completion ack this sets, and neither side expects any further DriveWire
-// traffic afterwards - only a power cycle restores normal FujiNet operation,
-// so nothing here worries about leaving state behind for a later session.
+// image.  Unlike before, this knock neither requests nor receives anything
+// of its own - the push already happened, unprompted, after whatever write
+// session triggered FujiNet to mount it - so there is nothing left to do
+// here but check s_cart_pending and switch.  The caller is expected to jump
+// to $C000 once it sees the completion ack this sets, and neither side
+// expects any further DriveWire traffic afterwards - only a power cycle
+// restores normal FujiNet operation, so nothing here worries about leaving
+// state behind for a later session.
 //
 // The completion ack deliberately goes through s_active_slot's own
 // DW_KNOCK_ACK_ADDR - still slot 0 at this point, still the byte this
@@ -990,85 +1805,60 @@ static bool dbc_recv_frame(uint8_t *device, uint8_t *command, uint16_t *payload_
 // aa765b4) was never sized or prioritised for that load.  Confirmed on real
 // hardware: leaving this loop running after a successful load corrupts served
 // reads within the cart's own first ~150 instruction fetches and then wedges
-// the bus outright.  Returns false on failure (no One ROM present, timeout,
-// or the image didn't fit) - the caller keeps monitoring normally, since
+// the bus outright.  Returns false when nothing has been pushed yet (or a
+// push failed/didn't fit) - the caller keeps monitoring normally, since
 // nothing has been activated and slot 0 is still what is being served.
 static bool drivewire_do_load_cart(void) {
-    // Clear the knock-accept ack immediately, before it can be mistaken for
-    // the *completion* ack below - drivewire_wait_for_knock() just set it to
-    // signal "knock landed", and if it were left at DW_KNOCK_ACK_VALUE, the
-    // caller's completion poll would see "done" instantly, before this
-    // function has asked FujiNet for anything yet.
+    // Clear the knock-accept ack drivewire_wait_for_knock() just set for
+    // match_cart, before it can be mistaken for the load-complete ack set
+    // below - see that function's own comment for why this is safe and why
+    // narrowing its ack to match_write only (removing the need for this
+    // clear) is off the table.
     s_reprogram(s_active_slot, DW_KNOCK_ACK_ADDR, &s_orig_ack_byte, 1u, 1u);
 
-    // Fire-and-forget: FUJI_PULL_ROM gets no reply of its own on the wire
-    // (matching FUJICMD_MOUNT_HOST and friends - see fuji_get_error()'s own,
-    // separate follow-up query in fujinet-lib for how a real CoCo client
-    // would normally check).  The DBC exchange below is the actual point.
-    // Device slot 0 is the only slot the config app's file browser ever
-    // mounts a ROM/CCC image into.
-    drivewire_uart_putc(FUJI_OP_FUJI);
-    drivewire_uart_putc(FUJI_CMD_PULL_ROM);
-    drivewire_uart_putc(0u);
-
-    uint32_t slot_size = 0;
-    ora_result_t size_rc = s_get_ram_slot_info(DW_CART_RAM_SLOT, NULL, &slot_size, NULL);
-
-    bool ok = true;
-    uint32_t offset = 0;
-    for (;;) {
-        uint8_t device, command;
-        uint16_t payload_len;
-        if (!dbc_recv_frame(&device, &command, &payload_len) || device != DBC_FUJI_DEVICEID) {
-            s_err_log("DriveWire: !LDCART! DBC frame timed out or malformed");
-            ok = false;
-            break;
-        }
-
-        if (command == DBC_CMD_NET_OPEN) {
-            // Payload: stream id (unused - device slot 0 only ever pushes a
-            // single ROM stream), then the stream's total size as 4
-            // little-endian bytes - see push_stream()'s own comment.
-            uint32_t size = 0;
-            if (payload_len >= 5u) {
-                size = (uint32_t)s_read_buf[1] | ((uint32_t)s_read_buf[2] << 8) |
-                       ((uint32_t)s_read_buf[3] << 16) | ((uint32_t)s_read_buf[4] << 24);
-            }
-            offset = 0;
-            bool fits = (size_rc == ORA_RESULT_OK) && (size <= slot_size);
-            dbc_send_frame(fits ? DBC_CMD_FUJI_ACK : DBC_CMD_FUJI_NAK);
-            if (!fits) {
-                s_err_log("DriveWire: cartridge image (%lu bytes) does not fit slot %u",
-                          (unsigned long)size, (unsigned)DW_CART_RAM_SLOT);
-                ok = false;
-                break;
-            }
-        } else if (command == DBC_CMD_NET_WRITE) {
-            for (uint16_t i = 0; i < payload_len && offset < slot_size; i++, offset++) {
-                s_reprogram(DW_CART_RAM_SLOT, offset, &s_read_buf[i], 1u, 0u);
-            }
-            dbc_send_frame(DBC_CMD_FUJI_ACK);
-        } else if (command == DBC_CMD_NET_CLOSE) {
-            // Abort-CLOSE (payload 0x01): FujiNet gave up mid-stream - unwedge
-            // without booting partial data.  Bare CLOSE = a complete transfer.
-            bool aborted = (payload_len > 0u && s_read_buf[0] == 0x01u);
-            dbc_send_frame(DBC_CMD_FUJI_ACK);
-            ok = !aborted;
-            break;
-        } else {
-            dbc_send_frame(DBC_CMD_FUJI_NAK);
-        }
+    if (!s_cart_pending) {
+        // Explicit failure status, so
+        // onerom_load_cart() doesn't have to infer "not pending" purely
+        // from its own knock-ack timing out.
+        uint8_t status = DW_CART_STATUS_FAILURE;
+        s_reprogram(s_active_slot, DW_CART_STATUS_ADDR, &status, 1u, 1u);
+        return false;
     }
-
-    if (!ok) {
-        return false;  // No completion ack sent - the caller's own poll times
-                        // out exactly as it would for "no One ROM connected";
-                        // nothing has been activated, so slot 0 keeps serving
-                        // as before.
-    }
+    s_cart_pending = false;
 
     uint8_t ack = DW_KNOCK_ACK_VALUE;
     s_reprogram(s_active_slot, DW_KNOCK_ACK_ADDR, &ack, 1u, 1u);
+
+    // Report what this plugin actually received, so
+    // fujinet-config can walk the activated cart's own memory afterward and
+    // recompute the same checksum independently. Written into slot 0
+    // (still active here) before the switch below, same as the ack above.
+    uint8_t len_lo = (uint8_t)(s_cart_received_len & 0xFFu);
+    uint8_t len_hi = (uint8_t)(s_cart_received_len >> 8);
+    uint8_t cksum_lo = (uint8_t)(s_cart_received_checksum & 0xFFu);
+    uint8_t cksum_hi = (uint8_t)(s_cart_received_checksum >> 8);
+    s_reprogram(s_active_slot, DW_CART_LEN_LO_ADDR, &len_lo, 1u, 1u);
+    s_reprogram(s_active_slot, DW_CART_LEN_HI_ADDR, &len_hi, 1u, 1u);
+    s_reprogram(s_active_slot, DW_CART_CKSUM_LO_ADDR, &cksum_lo, 1u, 1u);
+    s_reprogram(s_active_slot, DW_CART_CKSUM_HI_ADDR, &cksum_hi, 1u, 1u);
+    uint8_t status = DW_CART_STATUS_SUCCESS;
+    s_reprogram(s_active_slot, DW_CART_STATUS_ADDR, &status, 1u, 1u);
+
+    // A deliberate pause before the switch below, re-added (2026-10-14) and
+    // justified independently of an earlier attempt. Real-hardware testing with the pushed image being
+    // byte-identical to what slot 0 already serves (hdbonerom.rom itself)
+    // still hung the CoCo's poll with no recovery - which rules out any
+    // explanation that depends on the *new* slot's own content differing
+    // from the old one (e.g. a corrupted IRQ vector), since here it
+    // doesn't. That leaves the switch itself, or reading near it, as
+    // unsafe independent of what either slot contains - exactly what this
+    // pause is for. Sized far more generously than the previous attempt
+    // (~100x more cycles): that one was reverted after a report of
+    // corruption on unrelated ordinary traffic, but causation was never
+    // actually isolated - other unrelated edits were in flight in this
+    // same file at the time. Treat this specific value as unverified until
+    // tested in isolation again.
+    for (volatile int d = 0; d < 500000; d++) { }
 
     s_set_active_slot(DW_CART_RAM_SLOT);
     return true;
@@ -1078,6 +1868,31 @@ static bool drivewire_do_load_cart(void) {
 // ---------------------------------------------------------------------------
 // Setup
 // ---------------------------------------------------------------------------
+
+// Sets s_cart_window_size from the served chip type's size.  The cartridge
+// slot is served with the same chip configuration as the flash slot selected
+// at boot, so that slot's chip size is the window a pushed image has to fit
+// and mirror within - see s_cart_window_size's own comment.  ROM_SLOT_INDEX
+// counts every flash slot, plugins included, which is the indexing
+// get_flash_slot_ext_info() uses with no filter flags.
+//
+// noinline so these locals stay out of drivewire_setup()'s own frame, which
+// is live underneath pio_setup_address_monitor()'s 208-byte one - the
+// plugin's tightest stack point (see the comment above that call).
+__attribute__((noinline)) static void drivewire_resolve_cart_window(ora_lookup_fn_t ora_lookup_fn) {
+    ora_get_metadata_uint_fn_t get_metadata_uint = ora_lookup_fn(ORA_ID_GET_METADATA_UINT);
+    ora_get_flash_slot_ext_info_fn_t get_flash_slot_ext_info =
+        ora_lookup_fn(ORA_ID_GET_FLASH_SLOT_EXT_INFO);
+    uint32_t rom_slot_index = 0;
+    uint32_t chip_size = 0;
+    if (get_metadata_uint(ORA_METADATA_KEY_ROM_SLOT_INDEX, &rom_slot_index) == ORA_RESULT_OK &&
+        get_flash_slot_ext_info((uint8_t)rom_slot_index, 0u, 0u,
+                                NULL, NULL, &chip_size, NULL) == ORA_RESULT_OK) {
+        s_cart_window_size = chip_size;
+    } else {
+        s_err_log("DriveWire: served chip size unavailable - cartridge pushes will be refused");
+    }
+}
 
 static void drivewire_setup(ora_lookup_fn_t ora_lookup_fn) {
     s_log             = ora_lookup_fn(ORA_ID_LOG);
@@ -1145,6 +1960,8 @@ static void drivewire_setup(ora_lookup_fn_t ora_lookup_fn) {
         s_err_log("DriveWire: no active RAM slot at startup");
         s_active_slot = 0u;
     }
+
+    drivewire_resolve_cart_window(ora_lookup_fn);
 
     // Snapshot the real bytes at the channel addresses once, so sessions can
     // restore them afterwards - see the file header comment.
