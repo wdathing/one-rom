@@ -140,8 +140,20 @@ static const uint8_t s_knock_cart[KNOCK_LEN]  = {'!','L','D','C','A','R','T','!'
 #define DW_STATUS_ADDR   0x0100u
 #define DW_DATA_ADDR     0x0101u
 
-#define DW_STATUS_PENDING 0x00u
-#define DW_STATUS_READY   0xFFu
+// A read session's per-byte handshake - see dwoneread.asm's "Wire protocol"
+// for the CoCo side and the reasoning.  Each byte goes out with a toggle in
+// DW_STATUS_ADDR, alternating T0, T1, T0... from the first, and the CoCo
+// acknowledges it by reading DW_STATUS_ADDR + toggle.  The values are not
+// arbitrary: they are those acknowledgement addresses' own low bytes, which
+// dwoneread.asm relies on (one register both flips the toggle and addresses
+// its acknowledgement), so changing them breaks that ROM.
+#define DW_STATUS_T0      0x02u
+#define DW_STATUS_T1      0x03u
+_Static_assert((DW_STATUS_T0 & 1u) == 0u && (DW_STATUS_T0 | 1u) == DW_STATUS_T1,
+               "dwoneread.asm flips the toggle with EORB #1");
+_Static_assert(DW_STATUS_ADDR + DW_STATUS_T0 != DW_DATA_ADDR &&
+               DW_STATUS_ADDR + DW_STATUS_T1 != DW_DATA_ADDR,
+               "acknowledgement addresses must not alias the data address");
 
 // A third live ROM byte, deliberately in a different 256-byte page from
 // DW_STATUS_ADDR/DW_DATA_ADDR above.  Written to DW_KNOCK_ACK_VALUE the
@@ -160,8 +172,8 @@ static const uint8_t s_knock_cart[KNOCK_LEN]  = {'!','L','D','C','A','R','T','!'
 // full-address comparison against a byte outside that whole page can tell
 // "the CoCo is still polling for the ack" apart from "the CoCo is now
 // sending a real count/data byte that happens to have this low byte" - the
-// same reason drivewire_wait_for_data_read() below compares full addresses,
-// not low bytes, against DW_DATA_ADDR.
+// same reason drivewire_wait_for_ack() below compares full addresses, not
+// low bytes.
 #define DW_KNOCK_ACK_ADDR  0x0200u
 #define DW_KNOCK_ACK_VALUE 0xA5u
 
@@ -200,6 +212,18 @@ static const uint8_t s_knock_cart[KNOCK_LEN]  = {'!','L','D','C','A','R','T','!'
 // even on an overclocked RP2350 - so it only ever fires when nothing is
 // coming rather than shaving margin off any legitimately slow response.
 #define DW_UART_GETC_TIMEOUT 300000000ul
+
+// Bound, in drivewire_poll_addr() passes with nothing to show, on how long a
+// session waits for the CoCo's next ROM read - see drivewire_session_addr().
+// Inside a session the CoCo reads in a tight loop with interrupts masked, so
+// gaps are microseconds; the case this catches is a CoCo that has left the
+// session without a trace on the bus (a CoCo 3 after RESET runs entirely
+// from RAM and makes no cartridge reads at all).  Fixed rather than derived
+// from s_get_sysclk_mhz() for the same reason as DW_UART_GETC_TIMEOUT: a
+// pass is well under a microsecond, so this is a fraction of a second on any
+// clock, orders of magnitude past any legitimate gap and still a quick
+// recovery.
+#define DW_SESSION_IDLE_TIMEOUT 1000000ul
 
 // DBC (FujiBusPacket) SLIP framing and command bytes - see the "DBC
 // (FujiBusPacket)" section further down for how these are used.  Hoisted up
@@ -404,10 +428,10 @@ static uint8_t s_cart_push_chk;
 // the 2-byte checksum, and the 1-byte ack, each a separate session).
 static volatile uint8_t  s_debug_main_phase;
 static volatile uint32_t s_debug_session_count;
-// Increments on every single call to drivewire_next_addr(), the most
-// fundamental, frequently-hit function in the plugin - a definitive "is
-// anything at all still executing" signal, independent of which higher-level
-// function (do_read, do_write, wait_for_knock, wait_for_data_read) is
+// Increments on every pass of drivewire_poll_addr(), the most fundamental,
+// frequently-hit code in the plugin - a definitive "is anything at all still
+// executing" signal, independent of which higher-level function (do_read,
+// do_write, wait_for_knock, wait_for_ack) is
 // currently active.  If two peeks a few seconds apart show the exact same
 // value here, the plugin's core (core 0) is not merely busy-looping
 // somewhere - it has genuinely stopped running any code at all.
@@ -862,71 +886,121 @@ static void drivewire_push_probe_feed(uint8_t b) {
 // ora_demangle_addr_fn_t / ora_demangle_observed_addr_fn_t in api.h.  A
 // 40-pin target would need to use the latter for signalling.
 #ifndef DRIVEWIRE_TEST_PATTERN
-static uint32_t drivewire_next_addr(void) {
-    for (;;) {
-        s_debug_heartbeat++;
+// An address an aborted session read but did not belong to it, handed back
+// to the next drivewire_next_addr() call - see drivewire_session_addr().  A
+// CoCo that gave up on a session (or was reset) and is now knocking again
+// would otherwise lose that knock's first byte to the abort.  Held as the
+// address plus one, so the zeroed .bss means "none" and no separate flag
+// costs RAM this plugin is short of (logical addresses are far below
+// UINT32_MAX, so the +1 never wraps).
+static uint32_t s_pushback_addr_plus1;
 
-        // Opportunistically drain any UART1 RX byte that has already
-        // arrived, on every pass through this loop - not just while the
-        // ring buffer is empty (the CoCo's own instruction fetches, e.g.
-        // while copying DWRead's relocatable body onto the stack, are ROM
-        // reads too, so the buffer is rarely actually empty during exactly
-        // the window this matters, and gating on that meant this almost
-        // never ran).  Not just once a read session officially starts in
-        // drivewire_do_read() either: the DriveWire server responds to a
-        // request as soon as it parses it, and at 921600 baud its entire
-        // 256-byte response can arrive and overrun the 32-byte hardware RX
-        // FIFO well before the CoCo even finishes sending the knock that (as
-        // far as this plugin previously knew) starts a read session.  Fed
-        // through drivewire_push_probe_feed() rather than stashed directly,
-        // so a push starting here - mid-write-relay, or while scanning for
-        // the next knock - gets the same chance to be recognized as one
-        // starting right at a read session's own first byte - but only
-        // while s_push_probe_enabled, i.e. only once
-        // drivewire_do_write() has armed it (see that function's own
-        // comment).  Falls back to the plain stash otherwise, exactly as
-        // before any push support existed: confirmed on real hardware that
-        // ordinary sector data can coincidentally pass the full header
-        // check often enough, over a long enough session, to cause real
-        // (and costly - a falsely "confirmed" push blocks real traffic for
-        // seconds) failures if probed unconditionally rather than only
-        // during this bounded, content-armed window.
-        if (s_read_buf_filled < sizeof(s_read_buf) &&
-            !(UART_REG(DW_UART_BASE, UART_FR_OFFSET) & UART_FR_RXFE)) {
-            uint8_t b = (uint8_t)UART_REG(DW_UART_BASE, UART_DR_OFFSET);
-            if (s_push_probe_enabled) {
-                drivewire_push_probe_feed(b);
-            } else {
-                s_read_buf[s_read_buf_filled++] = b;
-            }
-        }
+// One pass of the address fetch: drains UART1 opportunistically (see below),
+// then takes the next ring-buffer entry if there is one.  Returns false with
+// nothing to show - an empty ring, or an entry that didn't demangle.
+// always_inline keeps it out of the call depth: it runs underneath
+// drivewire_do_read()'s deepest frames, where this plugin's stack margin is
+// thinnest.
+__attribute__((always_inline)) static inline bool drivewire_poll_addr(uint32_t *out) {
+    s_debug_heartbeat++;
 
-        // Disarm once the budget runs out with nothing confirmed - never
-        // while mid-probe (s_push_probe_state != PUSH_PROBE_IDLE), so a
-        // candidate header already in progress always gets to resolve
-        // (and, on failure, replay its raw bytes) rather than being
-        // abandoned mid-way with its bytes lost.  A probe is at most
-        // DBC_PROBE_RAW_CAP bytes, a handful of microseconds at 921600
-        // baud, so delaying disarm until it resolves costs nothing
-        // measurable against DW_PUSH_ARM_BUDGET's own multi-second span.
-        if (s_push_probe_enabled && s_push_probe_state == PUSH_PROBE_IDLE &&
-            --s_push_probe_arm_budget == 0u) {
-            s_push_probe_enabled = false;
+    // Opportunistically drain any UART1 RX byte that has already
+    // arrived, on every pass through this loop - not just while the
+    // ring buffer is empty (the CoCo's own instruction fetches, e.g.
+    // while copying DWRead's relocatable body onto the stack, are ROM
+    // reads too, so the buffer is rarely actually empty during exactly
+    // the window this matters, and gating on that meant this almost
+    // never ran).  Not just once a read session officially starts in
+    // drivewire_do_read() either: the DriveWire server responds to a
+    // request as soon as it parses it, and at 921600 baud its entire
+    // 256-byte response can arrive and overrun the 32-byte hardware RX
+    // FIFO well before the CoCo even finishes sending the knock that (as
+    // far as this plugin previously knew) starts a read session.  Fed
+    // through drivewire_push_probe_feed() rather than stashed directly,
+    // so a push starting here - mid-write-relay, or while scanning for
+    // the next knock - gets the same chance to be recognized as one
+    // starting right at a read session's own first byte - but only
+    // while s_push_probe_enabled, i.e. only once
+    // drivewire_do_write() has armed it (see that function's own
+    // comment).  Falls back to the plain stash otherwise, exactly as
+    // before any push support existed: confirmed on real hardware that
+    // ordinary sector data can coincidentally pass the full header
+    // check often enough, over a long enough session, to cause real
+    // (and costly - a falsely "confirmed" push blocks real traffic for
+    // seconds) failures if probed unconditionally rather than only
+    // during this bounded, content-armed window.
+    if (s_read_buf_filled < sizeof(s_read_buf) &&
+        !(UART_REG(DW_UART_BASE, UART_FR_OFFSET) & UART_FR_RXFE)) {
+        uint8_t b = (uint8_t)UART_REG(DW_UART_BASE, UART_DR_OFFSET);
+        if (s_push_probe_enabled) {
+            drivewire_push_probe_feed(b);
+        } else {
+            s_read_buf[s_read_buf_filled++] = b;
         }
-
-        if (RING_BUF_CUR_READ_INDEX() == RING_BUF_CUR_WRITE_INDEX()) {
-            ORA_TEST_YIELD();
-            continue;
-        }
-        uint32_t phys = (uint32_t)RING_BUF_GET_ENTRY(s_read_idx);
-        RING_BUF_ADV_READ_INDEX();
-
-        uint32_t logical;
-        if (s_demangle(phys, &logical, 1) == ORA_RESULT_OK) {
-            return logical;
-        }
-        // CS inactive or demangle error: discard and try next entry.
     }
+
+    // Disarm once the budget runs out with nothing confirmed - never
+    // while mid-probe (s_push_probe_state != PUSH_PROBE_IDLE), so a
+    // candidate header already in progress always gets to resolve
+    // (and, on failure, replay its raw bytes) rather than being
+    // abandoned mid-way with its bytes lost.  A probe is at most
+    // DBC_PROBE_RAW_CAP bytes, a handful of microseconds at 921600
+    // baud, so delaying disarm until it resolves costs nothing
+    // measurable against DW_PUSH_ARM_BUDGET's own multi-second span.
+    if (s_push_probe_enabled && s_push_probe_state == PUSH_PROBE_IDLE &&
+        --s_push_probe_arm_budget == 0u) {
+        s_push_probe_enabled = false;
+    }
+
+    if (RING_BUF_CUR_READ_INDEX() == RING_BUF_CUR_WRITE_INDEX()) {
+        ORA_TEST_YIELD();
+        return false;
+    }
+    uint32_t phys = (uint32_t)RING_BUF_GET_ENTRY(s_read_idx);
+    RING_BUF_ADV_READ_INDEX();
+
+    // CS inactive or demangle error: discarded, as nothing to show.
+    return s_demangle(phys, out, 1) == ORA_RESULT_OK;
+}
+
+// Blocks until the CoCo's next ROM read, however long that takes - the idle
+// wait for a knock.  Anything inside a session uses drivewire_session_addr()
+// instead.
+static uint32_t drivewire_next_addr(void) {
+    uint32_t addr;
+    if (s_pushback_addr_plus1 != 0u) {
+        addr = s_pushback_addr_plus1 - 1u;
+        s_pushback_addr_plus1 = 0u;
+        return addr;
+    }
+    while (!drivewire_poll_addr(&addr)) { }
+    return addr;
+}
+
+// Inside a session: the CoCo's next ROM read, or false if none arrives
+// within DW_SESSION_IDLE_TIMEOUT passes.  Every wait on the CoCo once a
+// knock has been accepted goes through here, so no session can wait on a
+// CoCo that has gone away - before this existed, one that crashed or was
+// reset mid-read left this plugin blocked forever waiting for the CoCo to
+// collect a byte, its status/data bytes still in live ROM, until One ROM
+// itself was power cycled.  Callers also abort on any address outside the
+// session's own protocol set (see drivewire_session_byte() and
+// drivewire_wait_for_ack()), the other way a departed CoCo shows -
+// with interrupts masked and DWRead/DWWrite running from the stack, a
+// session's only cartridge reads are its own signalling ones.
+static bool drivewire_session_addr(uint32_t *out) {
+    for (uint32_t idle = 0; idle < DW_SESSION_IDLE_TIMEOUT; idle++) {
+        if (drivewire_poll_addr(out)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Ends a session on an address that doesn't belong to it, handing that
+// address to the next knock scan rather than dropping it.
+static void drivewire_pushback(uint32_t addr) {
+    s_pushback_addr_plus1 = addr + 1u;
 }
 #endif // !DRIVEWIRE_TEST_PATTERN
 
@@ -1045,27 +1119,93 @@ static session_dir_t drivewire_wait_for_knock(void) {
 #endif // !DRIVEWIRE_TEST_PATTERN
 
 #ifndef DRIVEWIRE_TEST_PATTERN
-// Blocks until the CoCo reads the data channel address - the read session's
-// acknowledgement that it has collected the current byte, and thus safe to
-// serve the next one.
-static void drivewire_wait_for_data_read(void) {
+// Whether addr is one a CoCo inside a read session can read: the status poll,
+// the data read, and either toggle's acknowledgement (dwoneread.asm re-reads
+// the previous byte's on every poll pass).
+__attribute__((always_inline)) static inline bool drivewire_is_read_session_addr(uint32_t addr) {
+    return addr == DW_STATUS_ADDR || addr == DW_DATA_ADDR ||
+           addr == DW_STATUS_ADDR + DW_STATUS_T0 ||
+           addr == DW_STATUS_ADDR + DW_STATUS_T1;
+}
+
+// Waits for the CoCo to read ack_addr - its acknowledgement that it has
+// collected the current byte, so the next can be published (see
+// DW_STATUS_T0).  Every other read session address - status polls, the data
+// read, the previous byte's acknowledgement re-read on each poll pass - is
+// passed over.  False if the CoCo has left the session instead: no read at
+// all (see drivewire_session_addr()), or one outside that set.
+static bool drivewire_wait_for_ack(uint32_t ack_addr) {
+    uint32_t addr;
     for (;;) {
-        if (drivewire_next_addr() == DW_DATA_ADDR) return;
+        if (!drivewire_session_addr(&addr)) return false;
+        if (addr == ack_addr) return true;
+        if (!drivewire_is_read_session_addr(addr)) {
+            drivewire_pushback(addr);
+            return false;
+        }
     }
 }
 
-// Like drivewire_next_addr(), but silently discards any address exactly
-// equal to DW_KNOCK_ACK_ADDR before returning - see that macro's own
-// comment for why this must be a full-address compare, not the usual
-// low-byte mask.  Only a write session's own knock ever writes an ack there,
-// so this is a no-op for read sessions: the CoCo never generates that
-// address at all outside DWWrite's own poll loop.
-static uint32_t drivewire_next_addr_skip_ack(void) {
+// A read session's wait for the ESP32's next reply byte, or -1:
+// drivewire_uart_getc() with the same DW_UART_GETC_TIMEOUT, but also watching the ring meanwhile,
+// and giving up the moment the CoCo reads an address outside the read
+// session's set - it has left (dwoneread.asm's DWRead times out after ~1.4s,
+// as the bit-banger does) and is likely knocking again.  Without this, a
+// reply that never comes - an ESP32 still booting lost the request - held
+// this plugin in its UART wait for the whole timeout, several seconds, while
+// the CoCo's retry knocks overran the ring unread.  Reads the ring directly
+// rather than through drivewire_poll_addr(), whose opportunistic UART drain
+// would race this function for the very bytes it is waiting on.  Returns the
+// byte rather than writing through a pointer, which would pin the caller's
+// destination to a stack slot in drivewire_main()'s frame - see
+// drivewire_poll_addr() on the stack margin.
+static int drivewire_read_session_getc(void) {
+    uint32_t timeout = DW_UART_GETC_TIMEOUT;
+    while (UART_REG(DW_UART_BASE, UART_FR_OFFSET) & UART_FR_RXFE) {
+        if (--timeout == 0u) {
+            return -1;
+        }
+        if (RING_BUF_CUR_READ_INDEX() != RING_BUF_CUR_WRITE_INDEX()) {
+            uint32_t phys = (uint32_t)RING_BUF_GET_ENTRY(s_read_idx);
+            RING_BUF_ADV_READ_INDEX();
+            uint32_t addr;
+            if (s_demangle(phys, &addr, 1) == ORA_RESULT_OK &&
+                !drivewire_is_read_session_addr(addr)) {
+                drivewire_pushback(addr);
+                return -1;
+            }
+        }
+    }
+    return (int)(uint8_t)UART_REG(DW_UART_BASE, UART_DR_OFFSET);
+}
+
+// The next address-encoded byte of a session (count or write data), or -1
+// if the CoCo has left the session.  Returned rather than written through a
+// pointer, and always_inline, so neither caller's frame nor the session
+// call depth grows - see drivewire_poll_addr() on the stack margin.
+//
+// Silently discards any address exactly equal to DW_KNOCK_ACK_ADDR - see
+// that macro's own comment for why this must be a full-address compare, not
+// the usual low-byte mask.  Only a write session's own knock ever writes an
+// ack there, so this is a no-op for read sessions: the CoCo never generates
+// that address at all outside DWWrite's own poll loop.
+//
+// The CoCo sends each byte as "LDA B,U" with U at DW_STATUS_ADDR, and the
+// 6809's B offset is signed: $00-$7F land at DW_STATUS_ADDR up to +$7F, and
+// $80-$FF at DW_STATUS_ADDR -$80 up to -$01, the page below.  The low byte
+// of the address is the value either way, and anything outside that 256-byte
+// window ends the session.  (A first version accepted DW_STATUS_ADDR's page
+// alone, and so aborted every write carrying a byte of $80 or more.)
+__attribute__((always_inline)) static inline int drivewire_session_byte(void) {
     uint32_t addr;
     do {
-        addr = drivewire_next_addr();
+        if (!drivewire_session_addr(&addr)) return -1;
     } while (addr == DW_KNOCK_ACK_ADDR);
-    return addr;
+    if (addr - (DW_STATUS_ADDR - 0x80u) > 0xFFu) {
+        drivewire_pushback(addr);
+        return -1;
+    }
+    return (int)(addr & 0xFFu);
 }
 
 // ---------------------------------------------------------------------------
@@ -1081,7 +1221,18 @@ static void drivewire_do_write(uint16_t count) {
     uint16_t checksum = 0;
     uint8_t first_byte = 0;
     for (uint16_t i = 0; i < count; i++) {
-        uint8_t b = (uint8_t)(drivewire_next_addr() & 0xFFu);
+        int next = drivewire_session_byte();
+        if (next < 0) {
+            // The ESP32 has a truncated command, which it times out on.  No
+            // s_err_log() here or on the other session-abort paths: it
+            // formats through the firmware's RTT printf, ~330 bytes of this
+            // plugin's stack on top of drivewire_main()'s frame - more than
+            // there is.  The first version of this abort logged, and the
+            // log itself overflowed the stack and faulted the plugin.
+            s_reprogram(s_active_slot, DW_KNOCK_ACK_ADDR, &s_orig_ack_byte, 1u, 1u);
+            return;
+        }
+        uint8_t b = (uint8_t)next;
         if (i == 0) {
             first_byte = b;
         } else if (i == 1 && first_byte == FUJI_OP_FUJI &&
@@ -1152,6 +1303,12 @@ static void drivewire_do_write(uint16_t count) {
 }
 
 static void drivewire_do_read(uint16_t count) {
+    // The CoCo is already polling for the first byte's toggle, T0, and until
+    // now DW_STATUS_ADDR holds the ROM's own byte - so put T1 there before
+    // anything slower, rather than lean on that byte never being T0.
+    uint8_t not_yet = DW_STATUS_T1;
+    s_reprogram(s_active_slot, DW_STATUS_ADDR, &not_yet, 1u, 1u);
+
     // Before accepting this session's own first real reply byte, repeatedly
     // watch for (and fully consume) an unprompted cartridge push, but only
     // while s_push_probe_enabled (see drivewire_do_write()'s own comment
@@ -1167,11 +1324,13 @@ static void drivewire_do_read(uint16_t count) {
     // finishes pushing before it ever replies), a push never starts
     // arriving after its own reply has begun.
     while (s_push_probe_enabled && s_read_buf_filled == 0u && count > 0u) {
-        uint8_t b;
-        if (!drivewire_uart_getc(&b)) {
-            s_err_log("DriveWire: timed out waiting for UART1 RX, aborting session");
+        int next = drivewire_read_session_getc();
+        if (next < 0) {
+            // No s_err_log() - see drivewire_do_write()'s abort.
+            s_reprogram(s_active_slot, DW_STATUS_ADDR, &s_orig_status_byte, 1u, 1u);
             return;
         }
+        uint8_t b = (uint8_t)next;
         if (b != DBC_SLIP_END) {
             s_read_buf[s_read_buf_filled++] = b;
             break;
@@ -1194,21 +1353,23 @@ static void drivewire_do_read(uint16_t count) {
         s_debug_sticky_already = already;
     }
     for (uint16_t i = already; i < count; i++) {
-        if (!drivewire_uart_getc(&s_read_buf[i])) {
-            // Timed out: FujiNet never sent the rest of this response - most
-            // plausibly because an earlier, corrupted write left it still
-            // blocked reading a request that will never complete (see
-            // DW_UART_GETC_TIMEOUT's own comment).  Bail out to the next
-            // knock rather than wedging core 1 here forever: safe to do with
-            // no cleanup, since DW_STATUS_ADDR/DW_DATA_ADDR are still exactly
-            // as the previous session's own cleanup left them - this session
-            // has not touched either yet.  s_read_buf_filled is reset so a
-            // partially-filled buffer from this abort cannot be mistaken for
-            // a genuine pre-drain by whatever session starts next.
+        int next = drivewire_read_session_getc();
+        if (next < 0) {
+            // FujiNet never sent the rest of this response, or the CoCo gave
+            // up waiting for it (see drivewire_read_session_getc()) - an
+            // ESP32 still booting, or one still blocked reading an earlier,
+            // corrupted request (see DW_UART_GETC_TIMEOUT's own comment).
+            // Bail out to the next knock rather than wedging core 1 here:
+            // DW_DATA_ADDR is untouched so far, and DW_STATUS_ADDR is put
+            // back below.  s_read_buf_filled is reset so a partially-filled
+            // buffer from this abort cannot be mistaken for a genuine
+            // pre-drain by whatever session starts next.
             s_read_buf_filled = 0;
-            s_err_log("DriveWire: timed out waiting for UART1 RX, aborting session");
+            // No s_err_log() - see drivewire_do_write()'s abort.
+            s_reprogram(s_active_slot, DW_STATUS_ADDR, &s_orig_status_byte, 1u, 1u);
             return;
         }
+        s_read_buf[i] = (uint8_t)next;
     }
     s_read_buf_filled = 0;
 
@@ -1229,34 +1390,35 @@ static void drivewire_do_read(uint16_t count) {
         s_debug_sticky_session            = s_debug_session_count;
     }
 
+    uint8_t toggle = DW_STATUS_T0;
     for (uint16_t i = 0; i < count; i++) {
         uint8_t b = s_read_buf[i];
 
+        // Data before toggle: the CoCo reads DW_DATA_ADDR as soon as it sees
+        // the toggle, so the byte must already be there.
         if (s_reprogram(s_active_slot, DW_DATA_ADDR, &b, 1u, 1u) != ORA_RESULT_OK) {
             s_err_log("DriveWire: reprogram of data address failed");
             return;
         }
 
-        // Discard whatever the CoCo's own status poll loop already captured
-        // into the ring buffer while this iteration was preparing the byte
-        // above - that poll loop runs continuously, completely unthrottled,
-        // and every one of those reads lands in the same 64-entry ring
-        // buffer drivewire_wait_for_data_read() reads from below.  Must run
-        // *before* ready is set: the CoCo is polling continuously, so if it
-        // reacts before this line runs, the genuine data-read capture would
-        // already be sitting in the buffer and this would discard that too.
+        // Skip the backlog of the CoCo's poll loop, which runs unthrottled
+        // into the same 64-entry ring while the byte above is prepared.
+        // Safe to drop: this byte's acknowledgement cannot come before its
+        // toggle is published below, and the previous byte's re-reads are
+        // ignored anyway.
         s_read_idx = RING_BUF_CUR_WRITE_INDEX();
 
-        uint8_t ready = DW_STATUS_READY;
-        if (s_reprogram(s_active_slot, DW_STATUS_ADDR, &ready, 1u, 1u) != ORA_RESULT_OK) {
+        if (s_reprogram(s_active_slot, DW_STATUS_ADDR, &toggle, 1u, 1u) != ORA_RESULT_OK) {
             s_err_log("DriveWire: reprogram of status address failed");
             return;
         }
 
-        drivewire_wait_for_data_read();
-
-        uint8_t pending = DW_STATUS_PENDING;
-        s_reprogram(s_active_slot, DW_STATUS_ADDR, &pending, 1u, 1u);
+        if (!drivewire_wait_for_ack(DW_STATUS_ADDR + toggle)) {
+            // The CoCo has left the session - no s_err_log(), see
+            // drivewire_do_write()'s abort.
+            break;  // to the restore below - never leave these in live ROM
+        }
+        toggle ^= 1u;
     }
 
     // Restore the real ROM content at both channel addresses now the session
@@ -2243,9 +2405,15 @@ void drivewire_main(
         // dwoneread.asm's identical encoding (see either's own comment).
         // No more 0-means-256 special case: 16 bits already covers the
         // dw.h-documented 0-65535 range directly.
-        uint32_t count_hi = drivewire_next_addr_skip_ack() & 0xFFu;
-        uint32_t count_lo = drivewire_next_addr_skip_ack() & 0xFFu;
-        uint16_t count = (uint16_t)((count_hi << 8) | count_lo);
+        int count_hi = drivewire_session_byte();
+        int count_lo = (count_hi < 0) ? -1 : drivewire_session_byte();
+        if (count_lo < 0) {
+            // The CoCo left before sending its count - no s_err_log(), see
+            // drivewire_do_write()'s abort.
+            s_reprogram(s_active_slot, DW_KNOCK_ACK_ADDR, &s_orig_ack_byte, 1u, 1u);
+            continue;
+        }
+        uint16_t count = (uint16_t)(((uint16_t)count_hi << 8) | count_lo);
         s_debug_current_count = count;
 
         if (dir == SESSION_WRITE) {

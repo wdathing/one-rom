@@ -47,26 +47,49 @@ onerom program --plugin usb --plugin file=drivewire/build/drivewire_plugin.bin \
 Signalling rides the ROM address bus, the same idiom the host-control
 (RBCP) plugin uses to let the CPU "sneak" data out over a bus it can
 otherwise only read from - see that plugin's README for the general model.
-Two knock sequences (8 bytes each, matched against the observed address's
-low byte) pick the session direction:
+Three knock sequences (8 bytes each, matched against the observed address's
+low byte) pick the session:
 
-- `!DWSEND!` - write session (CoCo -> server). Followed by a count byte (0
-  means 256), then that many further address-encoded reads, each forwarded
-  to UART1 TX.
-- `!DWRECV!` - read session (server -> CoCo). Followed by a count byte.
-  For each byte: the plugin blocks on UART1 RX, writes the byte to a fixed
-  logical "data" address, then flips a fixed logical "status" address to a
-  ready sentinel (`0xFF`). The CoCo spin-reads status until ready, then
-  reads data to collect the byte. The plugin does not prepare the next byte
-  until it observes the CoCo's read of the data address.
+- `!DWSEND!` - write session (CoCo -> server). The plugin acknowledges the
+  knock at `$C200`, which the CoCo polls, resending the knock if it sees
+  nothing. Two count bytes follow (high byte first, 0-65535), then that many
+  data bytes, each forwarded to UART1 TX.
+- `!DWRECV!` - read session (server -> CoCo). Two count bytes follow. The
+  plugin then hands over each reply byte with a toggle-and-acknowledge
+  handshake, described below.
+- `!LDCART!` - activates a cartridge image FujiNet has already pushed (see
+  the CHANGELOG for 1.1.0).
 
-The status/data addresses are ordinary ROM offsets (`$C100`/`$C101` in CPU
-space for the 8K 2764 this plugin currently targets) - live hdbdos code, not
-spare padding. Overwriting them is safe and fully reversible: the plugin
-reads and caches the real bytes there once at startup, and restores them
-the moment each read session ends, so outside an active session the served
-image is exactly what it was assembled as. The knock sequences themselves
-are pure reads and never touch served content.
+Each count or data byte is sent as a read of `$C100` plus the byte as a
+signed offset (the 6809's `LDA B,U`), so the address's low byte is the
+value, and the address itself falls anywhere in `$C080`-`$C17F`.
+
+In a read session, for each byte the plugin writes it to the data address
+`$C101`, then sets the status address `$C100` to that byte's toggle: `$02`
+for the first byte, then alternating `$03`, `$02`... The CoCo waits for the
+toggle, reads the data, and acknowledges by reading `$C100` plus the toggle
+(`$C102` or `$C103`). The plugin publishes the next byte only once it has
+seen that. Waiting for a value that changes, rather than for a ready flag,
+means a fast CoCo - a CoCo 3 at double speed - can't collect the same byte
+twice. While polling, the CoCo also re-reads the previous byte's
+acknowledgement address, so an acknowledgement the plugin missed costs one
+more poll rather than a hang.
+
+The plugin ends a session early, and goes back to waiting for a knock, when
+the CoCo stops reading or reads an address outside the session's own set:
+it crashed, was reset, or gave up. HDB-DOS's `DWRead` gives up after about
+1.4 seconds without a byte, as the stock bit-banger version does.
+
+The handshake must match HDB-DOS's ONEROM build: this plugin needs the
+`dwoneread.asm` with the same toggle protocol, and the two ship together.
+
+The status, data and acknowledgement addresses are ordinary offsets into the
+HDB-DOS image - live code, not spare padding. Overwriting them is safe and
+fully reversible: the plugin reads and caches the real bytes once at
+startup, and restores them the moment each read session ends, so outside an
+active session the served image is exactly what it was assembled as. The
+knock sequences and acknowledgements are pure reads and never touch served
+content.
 
 ## Future: multi-ROM CoCo replacement
 
