@@ -75,10 +75,18 @@ twice. While polling, the CoCo also re-reads the previous byte's
 acknowledgement address, so an acknowledgement the plugin missed costs one
 more poll rather than a hang.
 
+Before the first byte - while the plugin waits for the ESP32's reply, or
+receives a cartridge push that comes ahead of it - the plugin flips the
+status between `$03` and `$01` as a heartbeat. HDB-DOS's `DWRead` gives up
+after about 1.4 seconds (0.7 at double speed) with the status unchanged, as
+the stock bit-banger version does without a byte, but restarts that count
+on every change. So the CoCo waits as long as the plugin is visibly
+working, and still gives up promptly when the plugin or the ESP32 has gone
+quiet.
+
 The plugin ends a session early, and goes back to waiting for a knock, when
 the CoCo stops reading or reads an address outside the session's own set:
-it crashed, was reset, or gave up. HDB-DOS's `DWRead` gives up after about
-1.4 seconds without a byte, as the stock bit-banger version does.
+it crashed, was reset, or gave up.
 
 The handshake must match HDB-DOS's ONEROM build: this plugin needs the
 `dwoneread.asm` with the same toggle protocol, and the two ship together.
