@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.2.0] - 2026-10-25
+
+- Supports the CoCo 3, including at double speed. Reads use a new toggle-and-acknowledge handshake, which needs the matching HDB-DOS ONEROM build.
+- Recovers when the CoCo crashes, is reset or gives up partway through a transfer, instead of needing One ROM power cycled.
+
 ## [1.1.0] - 2026-10-23
 
 The plugin now receives a cartridge image FujiNet pushes automatically when a ROM is
