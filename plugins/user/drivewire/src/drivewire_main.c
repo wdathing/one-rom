@@ -155,6 +155,13 @@ _Static_assert(DW_STATUS_ADDR + DW_STATUS_T0 != DW_DATA_ADDR &&
                DW_STATUS_ADDR + DW_STATUS_T1 != DW_DATA_ADDR,
                "acknowledgement addresses must not alias the data address");
 
+// The heartbeat's other value, alternating with DW_STATUS_T1 while a read
+// session waits for the ESP32 - see drivewire_heartbeat().  Any value but
+// DW_STATUS_T0 works, since the CoCo is waiting for T0 throughout.
+#define DW_STATUS_BUSY    0x01u
+_Static_assert(DW_STATUS_BUSY != DW_STATUS_T0 && DW_STATUS_BUSY != DW_STATUS_T1,
+               "the heartbeat must never show the first byte's toggle");
+
 // A third live ROM byte, deliberately in a different 256-byte page from
 // DW_STATUS_ADDR/DW_DATA_ADDR above.  Written to DW_KNOCK_ACK_VALUE the
 // instant a write-session or "!LDCART!" knock matches (see
@@ -224,6 +231,18 @@ _Static_assert(DW_STATUS_ADDR + DW_STATUS_T0 != DW_DATA_ADDR &&
 // clock, orders of magnitude past any legitimate gap and still a quick
 // recovery.
 #define DW_SESSION_IDLE_TIMEOUT 1000000ul
+
+// How long a read session keeps up its heartbeat (see drivewire_heartbeat())
+// while waiting for one reply byte with nothing at all from the ESP32.  The
+// heartbeat claims the ESP32 is working on the request, but this plugin
+// can't know that: an ESP32 still booting at power-on has simply lost it,
+// and beating on regardless held the CoCo for this plugin's whole UART
+// timeout, tens of seconds, on every boot-probe retry.  So beat only for as
+// long as a genuinely slow reply plausibly takes - a file open, say, before
+// the cartridge push it triggers, whose own frames beat for themselves - and
+// then go quiet, letting DWRead time out ~1.4s later and retry.  Real time,
+// not a loop count: the wait loop's speed varies with what it finds.
+#define DW_HEARTBEAT_IDLE_MS 3000u
 
 // DBC (FujiBusPacket) SLIP framing and command bytes - see the "DBC
 // (FujiBusPacket)" section further down for how these are used.  Hoisted up
@@ -317,6 +336,7 @@ static ora_get_sysclk_mhz_fn_t              s_get_sysclk_mhz;
 static ora_start_address_monitor_fn_t       s_start_monitor;
 static ora_get_address_monitor_ring_write_pos_fn_t s_get_write_pos;
 static ora_set_status_led_fn_t              s_set_status_led;
+static ora_get_plugin_uptime_ms_fn_t        s_uptime_ms;
 
 // ---------------------------------------------------------------------------
 // State
@@ -1146,24 +1166,64 @@ static bool drivewire_wait_for_ack(uint32_t ack_addr) {
     }
 }
 
+// Nonzero only while a read session waits for the ESP32, before its first
+// byte is published: the value DW_STATUS_ADDR is showing, DW_STATUS_T1 or
+// DW_STATUS_BUSY.  Zero everywhere else, which keeps drivewire_heartbeat()
+// from ever writing DW_STATUS_ADDR outside that window - it is live HDB-DOS
+// code the rest of the time.
+static uint8_t s_heartbeat;
+
+// Flips DW_STATUS_ADDR between DW_STATUS_T1 and DW_STATUS_BUSY, if a read
+// session is waiting.  dwoneread.asm's DWRead restarts its ~1.4s timeout
+// whenever the status changes, so the CoCo waits as long as this keeps
+// beating - through a slow reply or a whole cartridge push - and gives up
+// promptly once nothing is.  A fixed timeout couldn't tell the two apart: a
+// double-speed CoCo 3 timed out at 0.7s on a MOUNT IMAGE whose reply came
+// ~1.0s later, after the file open and the 16K push it triggers.  Writes
+// from s_heartbeat itself, so no local of its own needs a stack slot.
+// Called only from depths that already make an s_reprogram() call (see
+// drivewire_poll_addr() on the stack margin) - never from
+// drivewire_uart_getc(), which runs deeper inside the push receive.
+__attribute__((always_inline)) static inline void drivewire_heartbeat(void) {
+    if (s_heartbeat == 0u) return;
+    s_heartbeat ^= (uint8_t)(DW_STATUS_T1 ^ DW_STATUS_BUSY);
+    s_reprogram(s_active_slot, DW_STATUS_ADDR, &s_heartbeat, 1u, 1u);
+}
+
 // A read session's wait for the ESP32's next reply byte, or -1:
-// drivewire_uart_getc() with the same DW_UART_GETC_TIMEOUT, but also watching the ring meanwhile,
-// and giving up the moment the CoCo reads an address outside the read
-// session's set - it has left (dwoneread.asm's DWRead times out after ~1.4s,
-// as the bit-banger does) and is likely knocking again.  Without this, a
-// reply that never comes - an ESP32 still booting lost the request - held
-// this plugin in its UART wait for the whole timeout, several seconds, while
-// the CoCo's retry knocks overran the ring unread.  Reads the ring directly
-// rather than through drivewire_poll_addr(), whose opportunistic UART drain
-// would race this function for the very bytes it is waiting on.  Returns the
-// byte rather than writing through a pointer, which would pin the caller's
-// destination to a stack slot in drivewire_main()'s frame - see
-// drivewire_poll_addr() on the stack margin.
+// drivewire_uart_getc() with the same DW_UART_GETC_TIMEOUT, but beating the
+// heartbeat (see drivewire_heartbeat()) and watching the ring meanwhile -
+// giving up the moment the CoCo reads an address outside the read session's
+// set, because it has left (DWRead timed out) and is likely knocking again.
+// Without that, a reply that never comes - an ESP32 still booting lost the
+// request - held this plugin in its UART wait for the whole timeout, several
+// seconds, while the CoCo's retry knocks overran the ring unread.  Reads the
+// ring directly rather than through drivewire_poll_addr(), whose
+// opportunistic UART drain would race this function for the very bytes it is
+// waiting on.  Returns the byte rather than writing through a pointer, which
+// would pin the caller's destination to a stack slot in drivewire_main()'s
+// frame - see drivewire_poll_addr() on the stack margin.
 static int drivewire_read_session_getc(void) {
     uint32_t timeout = DW_UART_GETC_TIMEOUT;
+    uint32_t beat_start_ms = 0;
+    bool     beat_started = false;
     while (UART_REG(DW_UART_BASE, UART_FR_OFFSET) & UART_FR_RXFE) {
         if (--timeout == 0u) {
             return -1;
+        }
+        // Every 4096 passes - well under a millisecond on any clock, and far
+        // inside DWRead's timeout, but rare enough to cost nothing.  Beats
+        // only for DW_HEARTBEAT_IDLE_MS of this wait; the clock is read
+        // lazily, here, so a byte already waiting costs no call at all.
+        if ((timeout & 0xFFFu) == 0u) {
+            uint32_t now_ms = s_uptime_ms();
+            if (!beat_started) {
+                beat_started = true;
+                beat_start_ms = now_ms;
+            }
+            if (now_ms - beat_start_ms < DW_HEARTBEAT_IDLE_MS) {
+                drivewire_heartbeat();
+            }
         }
         if (RING_BUF_CUR_READ_INDEX() != RING_BUF_CUR_WRITE_INDEX()) {
             uint32_t phys = (uint32_t)RING_BUF_GET_ENTRY(s_read_idx);
@@ -1305,9 +1365,11 @@ static void drivewire_do_write(uint16_t count) {
 static void drivewire_do_read(uint16_t count) {
     // The CoCo is already polling for the first byte's toggle, T0, and until
     // now DW_STATUS_ADDR holds the ROM's own byte - so put T1 there before
-    // anything slower, rather than lean on that byte never being T0.
-    uint8_t not_yet = DW_STATUS_T1;
-    s_reprogram(s_active_slot, DW_STATUS_ADDR, &not_yet, 1u, 1u);
+    // anything slower, rather than lean on that byte never being T0.  This
+    // also starts the heartbeat window (see drivewire_heartbeat()), which
+    // every exit from here to the first publish must close.
+    s_heartbeat = DW_STATUS_T1;
+    s_reprogram(s_active_slot, DW_STATUS_ADDR, &s_heartbeat, 1u, 1u);
 
     // Before accepting this session's own first real reply byte, repeatedly
     // watch for (and fully consume) an unprompted cartridge push, but only
@@ -1327,6 +1389,7 @@ static void drivewire_do_read(uint16_t count) {
         int next = drivewire_read_session_getc();
         if (next < 0) {
             // No s_err_log() - see drivewire_do_write()'s abort.
+            s_heartbeat = 0u;
             s_reprogram(s_active_slot, DW_STATUS_ADDR, &s_orig_status_byte, 1u, 1u);
             return;
         }
@@ -1366,6 +1429,7 @@ static void drivewire_do_read(uint16_t count) {
             // pre-drain by whatever session starts next.
             s_read_buf_filled = 0;
             // No s_err_log() - see drivewire_do_write()'s abort.
+            s_heartbeat = 0u;
             s_reprogram(s_active_slot, DW_STATUS_ADDR, &s_orig_status_byte, 1u, 1u);
             return;
         }
@@ -1390,6 +1454,7 @@ static void drivewire_do_read(uint16_t count) {
         s_debug_sticky_session            = s_debug_session_count;
     }
 
+    s_heartbeat = 0u;  // close the heartbeat window - T0 goes out next
     uint8_t toggle = DW_STATUS_T0;
     for (uint16_t i = 0; i < count; i++) {
         uint8_t b = s_read_buf[i];
@@ -1758,6 +1823,7 @@ static bool drivewire_dbc_receive_cart(uint8_t device, uint8_t command, uint16_t
             bool slot_ok = (size_rc == ORA_RESULT_OK &&
                             window_size != 0u && window_size <= slot_size);
             dbc_send_frame(slot_ok ? DBC_CMD_FUJI_ACK : DBC_CMD_FUJI_NAK);
+            drivewire_heartbeat();  // see the NET_WRITE case below
             if (!slot_ok) {
                 s_err_log("DriveWire: cartridge push: slot %u size unavailable",
                           (unsigned)DW_CART_RAM_SLOT);
@@ -1785,6 +1851,11 @@ static bool drivewire_dbc_receive_cart(uint8_t device, uint8_t command, uint16_t
                 }
             }
             dbc_send_frame(DBC_CMD_FUJI_ACK);
+            // One beat per frame, every few milliseconds of a push, so a
+            // CoCo waiting on the reply behind it doesn't time out - see
+            // drivewire_heartbeat().  A no-op for a push arriving outside a
+            // read session.
+            drivewire_heartbeat();
         } else if (command == DBC_CMD_NET_CLOSE) {
             // Abort-CLOSE (payload 0x01): FujiNet gave up mid-stream - unwedge
             // without activating partial data.  Bare CLOSE = a complete transfer.
@@ -2067,6 +2138,7 @@ static void drivewire_setup(ora_lookup_fn_t ora_lookup_fn) {
     s_get_ram_slot_info = ora_lookup_fn(ORA_ID_GET_RAM_SLOT_INFO);
     s_get_sysclk_mhz  = ora_lookup_fn(ORA_ID_GET_SYSCLK_MHZ);
     s_set_status_led  = ora_lookup_fn(ORA_ID_SET_STATUS_LED);
+    s_uptime_ms       = ora_lookup_fn(ORA_ID_GET_PLUGIN_UPTIME_MS);
 
     ora_setup_address_monitor_fn_t setup_monitor = ora_lookup_fn(ORA_ID_SETUP_ADDRESS_MONITOR);
     s_start_monitor = ora_lookup_fn(ORA_ID_START_ADDRESS_MONITOR);
