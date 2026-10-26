@@ -10,7 +10,7 @@ OBJDUMP := $(if $(TOOLCHAIN),$(TOOLCHAIN)/arm-none-eabi-objdump,arm-none-eabi-ob
 
 MAJOR_VERSION := 1
 MINOR_VERSION := 2
-PATCH_VERSION := 0
+PATCH_VERSION := 1
 BUILD_VERSION := 0
 
 # TEST_PATTERN=1 builds the bring-up test variant (see drivewire_main.c) -
