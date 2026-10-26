@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.2.1] - 2026-10-25
+
+- Fixes cartridge loading on a CoCo 3 at double speed, which timed out waiting for the reply behind the cartridge push. Works with either HDB-DOS ONEROM build, but needs the matching one for the fix.
+- Cold boot reaches Config sooner when the ESP32 is still starting up.
+
 ## [1.2.0] - 2026-10-25
 
 - Supports the CoCo 3, including at double speed. Reads use a new toggle-and-acknowledge handshake, which needs the matching HDB-DOS ONEROM build.
