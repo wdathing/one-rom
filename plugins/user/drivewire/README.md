@@ -3,9 +3,10 @@
 Bridges a DriveWire session between a TRS-80 Color Computer (or Dragon
 32/64) disk controller ROM and a real DriveWire server, over One ROM's
 RP2350 UART1 hardware, instead of the CoCo's own bit-banger serial port.
-UART1 runs at 921600 baud, well beyond what the CoCo's bit-banger port can
+UART1 runs at 5 Mbps, well beyond what the CoCo's bit-banger port can
 reach, so the ROM-bus link to the CoCo is the bottleneck rather than the
-link to the server.
+link to the server. The ESP32 end must run at the same rate, and
+`make BAUD=<rate>` builds the plugin for another one.
 
 This plugin is one half of the system: the other half is a modified hdbdos
 build (`dwonewrite.asm`/`dwoneread.asm`, the `ONEROM` variant) in the
