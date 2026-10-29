@@ -9,20 +9,14 @@ OBJCOPY := $(if $(TOOLCHAIN),$(TOOLCHAIN)/arm-none-eabi-objcopy,arm-none-eabi-ob
 OBJDUMP := $(if $(TOOLCHAIN),$(TOOLCHAIN)/arm-none-eabi-objdump,arm-none-eabi-objdump)
 
 MAJOR_VERSION := 1
-MINOR_VERSION := 2
-PATCH_VERSION := 1
+MINOR_VERSION := 3
+PATCH_VERSION := 0
 BUILD_VERSION := 0
-
-# TEST_PATTERN=1 builds the bring-up test variant (see drivewire_main.c) -
-# waits for the write knock, lights the status LED, then relays an
-# incrementing byte pattern to UART1 forever, instead of the real protocol.
-TEST_PATTERN ?= 0
 
 # TEST_UART_ONLY=1 builds an even more minimal bring-up test: brings up
 # UART1 and blasts a repeating pattern forever, skipping the address monitor
 # and knock logic entirely.  Isolates UART1's own hardware bring-up from
-# everything else.  Mutually exclusive with TEST_PATTERN=1 (this one wins if
-# both are set).  Most of the file's functions go genuinely unused in this
+# everything else.  Most of the file's functions go genuinely unused in this
 # build, so warnings are relaxed rather than threading a third set of
 # #ifndef guards through otherwise-unrelated code for a throwaway test.
 TEST_UART_ONLY ?= 0
@@ -35,9 +29,10 @@ TEST_UART_ONLY ?= 0
 # other TEST_* variants.
 TEST_UART_SPACED ?= 0
 
-# BAUD overrides UART1's baud rate (default 921600, see DW_UART_BAUD in
-# drivewire_main.c) - useful for bring-up testing against equipment that
-# can't reliably decode 921600, e.g. `make TEST_PATTERN=1 BAUD=115200`.
+# BAUD overrides UART1's baud rate (default 5000000, see DW_UART_BAUD in
+# drivewire_main.c) - useful against a DriveWire server set to another rate,
+# or for bring-up testing with equipment that can't decode 5 Mbps, e.g.
+# `make TEST_UART_SPACED=1 BAUD=115200`.
 BAUD ?=
 
 ORA_DIR := ../../../firmware/ora
@@ -63,7 +58,6 @@ CFLAGS := -mcpu=cortex-m33 -mthumb -mfloat-abi=hard -mfpu=fpv5-sp-d16 \
           -DMAJOR_VERSION=$(MAJOR_VERSION) -DMINOR_VERSION=$(MINOR_VERSION) \
           -DPATCH_VERSION=$(PATCH_VERSION) -DBUILD_VERSION=$(BUILD_VERSION) \
           $(SDRR_INCLUDE) $(ORA_INCLUDE) $(PLUGIN_INCLUDE) \
-          $(if $(filter 1,$(TEST_PATTERN)),-DDRIVEWIRE_TEST_PATTERN) \
           $(if $(filter 1,$(TEST_UART_ONLY)),-DDRIVEWIRE_TEST_UART_ONLY -Wno-unused-function -Wno-unused-variable) \
           $(if $(filter 1,$(TEST_UART_SPACED)),-DDRIVEWIRE_TEST_UART_SPACED -Wno-unused-function -Wno-unused-variable) \
           $(if $(BAUD),-DDW_UART_BAUD=$(BAUD)u)

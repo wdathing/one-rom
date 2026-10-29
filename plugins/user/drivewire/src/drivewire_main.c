@@ -46,9 +46,6 @@
 // would be indistinguishable from the CoCo simply pausing, and there is no
 // way to resynchronise cleanly, so DriveWire sessions must not be interrupted
 // by another plugin's exclusive-mode request.
-//
-// Build with DRIVEWIRE_TEST_PATTERN defined (make TEST_PATTERN=1) for a
-// bring-up test build that skips the real protocol - see drivewire_main().
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -120,14 +117,12 @@ static uint32_t            s_read_idx;
 
 #define KNOCK_LEN 8u
 static const uint8_t s_knock_write[KNOCK_LEN] = {'!','D','W','S','E','N','D','!'};  // "!DWSEND!" CoCo -> server
-#ifndef DRIVEWIRE_TEST_PATTERN
 static const uint8_t s_knock_read[KNOCK_LEN]  = {'!','D','W','R','E','C','V','!'};  // "!DWRECV!" server -> CoCo
 // CoCo -> plugin: activate an already-pushed cartridge/ROM image - see
 // drivewire_do_load_cart()'s own comment for the full protocol.  Not part of
 // DriveWire proper - a One-ROM-specific extension the config app's own
 // knock-sending code (not fujinet-lib, not hdbdos) speaks directly.
 static const uint8_t s_knock_cart[KNOCK_LEN]  = {'!','L','D','C','A','R','T','!'};  // "!LDCART!"
-#endif
 
 // ---------------------------------------------------------------------------
 // Protocol constants
@@ -206,7 +201,7 @@ _Static_assert(DW_STATUS_WAIT != DW_STATUS_READY && DW_STATUS_BUSY != DW_STATUS_
 #define DW_UART_TX_GPIO  40u
 #define DW_UART_RX_GPIO  41u
 #ifndef DW_UART_BAUD
-#define DW_UART_BAUD     921600u
+#define DW_UART_BAUD     5000000u
 #endif
 
 // Bound on how long drivewire_uart_getc() will wait for a single RX byte -
@@ -711,7 +706,6 @@ static void drivewire_uart_putc(uint8_t b) {
     UART_REG(DW_UART_BASE, UART_DR_OFFSET) = b;
 }
 
-#ifndef DRIVEWIRE_TEST_PATTERN
 // Records, and clears, any UART1 receive error since the last call - run once
 // per pass of drivewire_main()'s session loop.  The link has no flow control,
 // so a byte lost to a full RX FIFO is otherwise silent: the reply just goes on
@@ -742,7 +736,6 @@ static bool drivewire_uart_getc(uint8_t *out) {
     *out = (uint8_t)UART_REG(DW_UART_BASE, UART_DR_OFFSET);
     return true;
 }
-#endif
 
 // ---------------------------------------------------------------------------
 // Address bus signalling
@@ -889,7 +882,6 @@ static void drivewire_push_probe_feed(uint8_t b) {
 // observed (bus) address space this signalling rides in are identical - see
 // ora_demangle_addr_fn_t / ora_demangle_observed_addr_fn_t in api.h.  A
 // 40-pin target would need to use the latter for signalling.
-#ifndef DRIVEWIRE_TEST_PATTERN
 // An address an aborted session read but did not belong to it, handed back
 // to the next drivewire_next_addr() call - see drivewire_session_addr().  A
 // CoCo that gave up on a session (or was reset) and is now knocking again
@@ -920,7 +912,7 @@ __attribute__((always_inline)) static inline bool drivewire_poll_addr(uint32_t *
     // the window this matters, and gating on that meant this almost
     // never ran).  Not just once a read session officially starts in
     // drivewire_do_read() either: the DriveWire server responds to a
-    // request as soon as it parses it, and at 921600 baud its entire
+    // request as soon as it parses it, and at DW_UART_BAUD its entire
     // 256-byte response can arrive and overrun the 32-byte hardware RX
     // FIFO well before the CoCo even finishes sending the knock that (as
     // far as this plugin previously knew) starts a read session.  Fed
@@ -955,8 +947,8 @@ __attribute__((always_inline)) static inline bool drivewire_poll_addr(uint32_t *
     // candidate header already in progress always gets to resolve
     // (and, on failure, replay its raw bytes) rather than being
     // abandoned mid-way with its bytes lost.  A probe is at most
-    // DBC_PROBE_RAW_CAP bytes, a handful of microseconds at 921600
-    // baud, so delaying disarm until it resolves costs nothing
+    // DBC_PROBE_RAW_CAP bytes, well under a millisecond at
+    // DW_UART_BAUD, so delaying disarm until it resolves costs nothing
     // measurable against DW_PUSH_ARM_BUDGET's own multi-second span.
     if (s_push_probe_enabled && s_push_probe_state == PUSH_PROBE_IDLE &&
         --s_push_probe_arm_budget == 0u) {
@@ -1013,43 +1005,8 @@ static bool drivewire_session_addr(uint32_t *out) {
 static void drivewire_pushback(uint32_t addr) {
     s_pushback_addr_plus1 = addr + 1u;
 }
-#endif // !DRIVEWIRE_TEST_PATTERN
 
-#ifdef DRIVEWIRE_TEST_PATTERN
-// Bring-up-test-only variant of drivewire_next_addr(): if the ring buffer
-// sits empty for a while, emits a fixed heartbeat marker byte before going
-// back to waiting.  Without this, "the CoCo isn't sending anything" and
-// "the address monitor isn't capturing anything at all" both look
-// identical from outside (LED off, UART silent forever) - the caller's
-// relay loop can't emit a byte it never receives.  A repeating marker with
-// nothing else means the address monitor itself isn't seeing captures;
-// total silence (not even the marker) means something else broke.
-#define DRIVEWIRE_TEST_IDLE_MARKER   0xAAu
-#define DRIVEWIRE_TEST_IDLE_SPINS    2000000u
-static uint32_t drivewire_test_next_addr(void) {
-    uint32_t idle_spins = 0;
-    for (;;) {
-        if (RING_BUF_CUR_READ_INDEX() == RING_BUF_CUR_WRITE_INDEX()) {
-            if (++idle_spins == DRIVEWIRE_TEST_IDLE_SPINS) {
-                drivewire_uart_putc(DRIVEWIRE_TEST_IDLE_MARKER);
-                idle_spins = 0;
-            }
-            ORA_TEST_YIELD();
-            continue;
-        }
-        uint32_t phys = (uint32_t)RING_BUF_GET_ENTRY(s_read_idx);
-        RING_BUF_ADV_READ_INDEX();
 
-        uint32_t logical;
-        if (s_demangle(phys, &logical, 1) == ORA_RESULT_OK) {
-            return logical;
-        }
-        // CS inactive or demangle error: discard and try next entry.
-    }
-}
-#endif
-
-#ifndef DRIVEWIRE_TEST_PATTERN
 // Waits for either knock sequence, returning which one matched.
 //
 // The ORA knock API (ora_wait_for_knock_fn_t) matches exactly one configured
@@ -1127,9 +1084,7 @@ static session_dir_t drivewire_wait_for_knock(void) {
     }
     return result;
 }
-#endif // !DRIVEWIRE_TEST_PATTERN
 
-#ifndef DRIVEWIRE_TEST_PATTERN
 // Whether addr is one a CoCo inside a read session can read: the status poll,
 // the response window, and the acknowledgement.
 __attribute__((always_inline)) static inline bool drivewire_is_read_session_addr(uint32_t addr) {
@@ -1445,7 +1400,7 @@ static void drivewire_do_read(uint16_t count) {
     // Whatever it's got is already correct and in order; only read fresh
     // bytes for the rest.  The remaining reads have no handshake overhead
     // (drivewire_uart_getc() is a handful of cycles), so this drains far
-    // faster than bytes can arrive even at 921600 baud.
+    // faster than bytes can arrive even at 5 Mbps.
     uint16_t already = (s_read_buf_filled < count) ? s_read_buf_filled : count;
     for (uint16_t i = already; i < count; i++) {
         int next = drivewire_read_session_getc(i > 0u);
@@ -2127,7 +2082,6 @@ static bool drivewire_do_load_cart(void) {
     s_set_active_slot(DW_CART_RAM_SLOT);
     return true;
 }
-#endif // !DRIVEWIRE_TEST_PATTERN
 
 // ---------------------------------------------------------------------------
 // Setup
@@ -2248,30 +2202,6 @@ static void drivewire_setup(ora_lookup_fn_t ora_lookup_fn) {
     // succeeded, nothing to relay yet".
     drivewire_uart_init();
 
-#ifdef DRIVEWIRE_TEST_PATTERN
-    // Marker proving execution got this far, now that UART1 exists to prove
-    // it - the three-blink startup sequence's own last action is "LED off",
-    // so "LED off" alone does not prove drivewire_setup() ever ran.
-    for (int i = 0; i < 4; i++) drivewire_uart_putc(0x55u);
-    if (monitor_ok) {
-        // Reuses checkpoint 5's old value/count - monitor setup, write-pos
-        // lookup and start_monitor() all succeeded.
-        for (int i = 0; i < 8; i++) drivewire_uart_putc(0x99u);
-    } else if (monitor_rc != ORA_RESULT_OK) {
-        // Reuses checkpoint 3's old value/count/error-byte convention.
-        for (int i = 0; i < 6; i++) drivewire_uart_putc(0x77u);
-        drivewire_uart_putc((uint8_t)monitor_rc);
-    } else {
-        // Reuses checkpoint 4's old value/count - setup_monitor() succeeded
-        // but the write-position lookup failed.
-        for (int i = 0; i < 7; i++) drivewire_uart_putc(0x88u);
-    }
-    // Checkpoints 1a/1b/1c - get_active_slot()/read_slot() x2 - held since
-    // they ran before UART1 existed.
-    drivewire_uart_putc(0x61u);
-    for (int i = 0; i < 2; i++) drivewire_uart_putc(0x62u);
-    for (int i = 0; i < 3; i++) drivewire_uart_putc(0x63u);
-#endif
 
     if (!monitor_ok) {
         if (monitor_rc != ORA_RESULT_OK) {
@@ -2410,62 +2340,9 @@ void drivewire_main(
     }
 #endif
 
-#ifdef DRIVEWIRE_TEST_PATTERN
-    // Startup heartbeat, before anything else runs: without this, "LED off"
-    // while waiting for the knock is indistinguishable from "the plugin
-    // never started at all" (crashed in setup, never scheduled, etc).  Three
-    // quick blinks means the plugin is loaded and drivewire_main() is
-    // genuinely executing.
-    {
-        ora_set_status_led_fn_t blink_led = ora_lookup_fn(ORA_ID_SET_STATUS_LED);
-        for (int i = 0; i < 3; i++) {
-            blink_led(1);
-            for (volatile int d = 0; d < 3000000; d++) { }
-            blink_led(0);
-            for (volatile int d = 0; d < 3000000; d++) { }
-        }
-    }
-#endif
 
     drivewire_setup(ora_lookup_fn);
 
-#ifdef DRIVEWIRE_TEST_PATTERN
-    // Bring-up test: confirm the knock/UART chain works end to end before
-    // exercising the full protocol.  Pairs with hdbdos's ONEROM_TEST_PATTERN
-    // DWWrite, which sends its own knock and then an incrementing 0x00-0xFF
-    // pattern and never returns.
-    //
-    // Deliberately does NOT gate UART output on a successful knock match:
-    // relays every captured address's low byte to UART1 TX unconditionally,
-    // from the moment setup finishes.  If the 6809 code is running at all,
-    // the raw byte stream is visible on a scope regardless of whether the
-    // knock-matching logic below has a bug - that would otherwise be
-    // indistinguishable from DWWrite never having been called at all.  The
-    // status LED (forced off first - the board's boot-time default usually
-    // leaves it on) lights the first time the exact "!DWSEND!" sequence is
-    // seen in that stream, as a secondary, coarser signal.
-    s_set_status_led(0);
-    uint8_t window[KNOCK_LEN] = {0};
-    bool matched = false;
-    for (;;) {
-        uint8_t b = (uint8_t)(drivewire_test_next_addr() & 0xFFu);
-        drivewire_uart_putc(b);
-        if (!matched) {
-            for (unsigned i = 0; i < KNOCK_LEN - 1u; i++) {
-                window[i] = window[i + 1u];
-            }
-            window[KNOCK_LEN - 1u] = b;
-            bool m = true;
-            for (unsigned i = 0; i < KNOCK_LEN; i++) {
-                if (window[i] != s_knock_write[i]) { m = false; break; }
-            }
-            if (m) {
-                matched = true;
-                s_set_status_led(1);
-            }
-        }
-    }
-#else
     for (;;) {
         drivewire_check_uart_rx();
         s_debug_main_phase = 0u;
@@ -2535,5 +2412,4 @@ void drivewire_main(
             drivewire_error(DW_ERR_READ_COUNT, count);
         }
     }
-#endif
 }
