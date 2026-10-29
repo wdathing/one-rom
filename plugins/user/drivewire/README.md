@@ -54,9 +54,9 @@ low byte) pick the session:
   knock at `$C200`, which the CoCo polls, resending the knock if it sees
   nothing. Two count bytes follow (high byte first, 0-65535), then that many
   data bytes, each forwarded to UART1 TX.
-- `!DWRECV!` - read session (server -> CoCo). Two count bytes follow. The
-  plugin then hands over each reply byte with a toggle-and-acknowledge
-  handshake, described below.
+- `!DWRECV!` - read session (server -> CoCo). Two count bytes follow (at
+  most 256). The plugin then hands over the whole reply at once, described
+  below.
 - `!LDCART!` - activates a cartridge image FujiNet has already pushed (see
   the CHANGELOG for 1.1.0).
 
@@ -64,18 +64,23 @@ Each count or data byte is sent as a read of `$C100` plus the byte as a
 signed offset (the 6809's `LDA B,U`), so the address's low byte is the
 value, and the address itself falls anywhere in `$C080`-`$C17F`.
 
-In a read session, for each byte the plugin writes it to the data address
-`$C101`, then sets the status address `$C100` to that byte's toggle: `$02`
-for the first byte, then alternating `$03`, `$02`... The CoCo waits for the
-toggle, reads the data, and acknowledges by reading `$C100` plus the toggle
-(`$C102` or `$C103`). The plugin publishes the next byte only once it has
-seen that. Waiting for a value that changes, rather than for a ready flag,
-means a fast CoCo - a CoCo 3 at double speed - can't collect the same byte
-twice. While polling, the CoCo also re-reads the previous byte's
-acknowledgement address, so an acknowledgement the plugin missed costs one
-more poll rather than a hang.
+In a read session, the plugin collects the whole reply from the ESP32,
+writes it into a 256-byte window at `$E000`, and only then sets the status
+address `$C100` to `$02`. The CoCo waits for that, copies the window into
+its buffer at full bus speed, and acknowledges by reading `$C102`. One wait
+per reply replaces the handshake per byte that versions 1.2.x used, which
+cost the CoCo about 100 cycles a byte.
 
-Before the first byte - while the plugin waits for the ESP32's reply, or
+The copy is a stack blast: `PULU`/`PSHS` moving 7 bytes per instruction
+pair, with `PSHS` filling the buffer downwards. So the plugin writes the
+window to suit: the first *count* mod 7 bytes (which the CoCo copies singly),
+then the reply's last 7 bytes, then the 7 before those, and so on.
+
+The window is in the 27128's upper 8K, which an 8K HDB-DOS image leaves as a
+duplicate of itself or as padding, and which no code runs from. The plugin
+leaves the last reply there rather than restoring it.
+
+Until the reply is ready - while the plugin waits for the ESP32, or
 receives a cartridge push that comes ahead of it - the plugin flips the
 status between `$03` and `$01` as a heartbeat. HDB-DOS's `DWRead` gives up
 after about 1.4 seconds (0.7 at double speed) with the status unchanged, as
@@ -88,10 +93,15 @@ The plugin ends a session early, and goes back to waiting for a knock, when
 the CoCo stops reading or reads an address outside the session's own set:
 it crashed, was reset, or gave up.
 
-The handshake must match HDB-DOS's ONEROM build: this plugin needs the
-`dwoneread.asm` with the same toggle protocol, and the two ship together.
+A reply that stalls part way, 250 ms with bytes still to come, has lost
+bytes on the way from the ESP32. The plugin hands the CoCo what it has and
+drops the checksum the CoCo sends back, so the ESP32 answers with a checksum
+error and HDB-DOS rereads the sector instead of stopping with `?IO ERROR`.
 
-The status, data and acknowledgement addresses are ordinary offsets into the
+The read protocol must match HDB-DOS's ONEROM build: this plugin needs the
+`dwoneread.asm` that copies from the window, and the two ship together.
+
+The status and knock-acknowledgement addresses are ordinary offsets into the
 HDB-DOS image - live code, not spare padding. Overwriting them is safe and
 fully reversible: the plugin reads and caches the real bytes once at
 startup, and restores them the moment each read session ends, so outside an
