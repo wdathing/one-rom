@@ -395,6 +395,19 @@ static uint8_t s_read_buf[256];
 // bleed into the next.
 static uint16_t s_read_buf_filled;
 
+// Set by drivewire_check_uart_rx() on a UART1 receive error, and cleared by
+// drivewire_discard_stale() as each request goes out, which checks RSR first,
+// so at a sector's checksum it covers exactly that sector's reply - which
+// HDB-DOS then rereads.  Taken from RSR's sticky flags rather than from each
+// byte's own flags in DR: noting those as bytes were read cost
+// drivewire_main() 8 bytes of frame, through the drains inlined into it.
+static bool s_rx_suspect;
+
+// Set by drivewire_do_read() after a sector-sized reply, so the next session,
+// if it is a 2-byte write, is that sector's checksum.  Cleared by every other
+// session.
+static bool s_checksum_due;
+
 // Gates whether drivewire_next_addr()'s opportunistic drain engages
 // drivewire_push_probe_feed() at all.  Set only by drivewire_do_write()
 // recognizing a ROM-mount-triggering write (see its own comment) - content-
@@ -491,6 +504,7 @@ enum {
     DW_ERR_STATUS_BYTE,        // the ROM's own byte at DW_STATUS_ADDR reads as ready
     DW_ERR_UART_RX,            // arg: UART1's RSR - 8 overrun, 4 break, 2 parity, 1 framing
     DW_ERR_READ_SHORT,         // arg: reply bytes received - see DW_REPLY_GAP_MS
+    DW_ERR_STALE_RX,           // arg: bytes discarded - see drivewire_discard_stale()
 };
 static volatile struct {
     uint8_t  code;
@@ -718,7 +732,10 @@ __attribute__((noinline)) static void drivewire_check_uart_rx(void) {
     uint32_t rsr = UART_REG(DW_UART_BASE, UART_RSR_OFFSET) &
         (UART_RSR_OE | UART_RSR_BE | UART_RSR_PE | UART_RSR_FE);
     if (rsr != 0u) {
-        UART_REG(DW_UART_BASE, UART_RSR_OFFSET) = 0;
+        // Any write clears the flags.  Writing rsr back rather than 0 saves
+        // a register, which kept this function stackless.
+        UART_REG(DW_UART_BASE, UART_RSR_OFFSET) = rsr;
+        s_rx_suspect = true;
         drivewire_error(DW_ERR_UART_RX, (uint16_t)rsr);
     }
 }
@@ -882,6 +899,7 @@ static void drivewire_push_probe_feed(uint8_t b) {
 // observed (bus) address space this signalling rides in are identical - see
 // ora_demangle_addr_fn_t / ora_demangle_observed_addr_fn_t in api.h.  A
 // 40-pin target would need to use the latter for signalling.
+
 // An address an aborted session read but did not belong to it, handed back
 // to the next drivewire_next_addr() call - see drivewire_session_addr().  A
 // CoCo that gave up on a session (or was reset) and is now knocking again
@@ -890,6 +908,23 @@ static void drivewire_push_probe_feed(uint8_t b) {
 // costs RAM this plugin is short of (logical addresses are far below
 // UINT32_MAX, so the +1 never wraps).
 static uint32_t s_pushback_addr_plus1;
+
+// Moves every byte UART1 has already received into s_read_buf, or through the
+// cart-push probe while it is armed - see drivewire_poll_addr() for why every
+// pass does this.  Stops early with s_read_buf full, or with a push confirmed:
+// the bytes behind its header are the push's own, left in the FIFO for
+// drivewire_receive_confirmed_push().
+__attribute__((always_inline)) static inline void drivewire_drain_rx(void) {
+    while (s_read_buf_filled < sizeof(s_read_buf) && !s_cart_push_confirmed &&
+           !(UART_REG(DW_UART_BASE, UART_FR_OFFSET) & UART_FR_RXFE)) {
+        uint8_t b = (uint8_t)UART_REG(DW_UART_BASE, UART_DR_OFFSET);
+        if (s_push_probe_enabled) {
+            drivewire_push_probe_feed(b);
+        } else {
+            s_read_buf[s_read_buf_filled++] = b;
+        }
+    }
+}
 
 // One pass of the address fetch: drains UART1 opportunistically (see below),
 // then takes the next ring-buffer entry if there is one.  Returns false with
@@ -929,18 +964,9 @@ __attribute__((always_inline)) static inline bool drivewire_poll_addr(uint32_t *
     // (and costly - a falsely "confirmed" push blocks real traffic for
     // seconds) failures if probed unconditionally rather than only
     // during this bounded, content-armed window.
-    // Stops the moment a push is confirmed: the bytes behind its header are
-    // the push's own, left in the FIFO for drivewire_receive_confirmed_push(),
-    // which the caller runs as soon as this pass returns.
-    while (s_read_buf_filled < sizeof(s_read_buf) && !s_cart_push_confirmed &&
-           !(UART_REG(DW_UART_BASE, UART_FR_OFFSET) & UART_FR_RXFE)) {
-        uint8_t b = (uint8_t)UART_REG(DW_UART_BASE, UART_DR_OFFSET);
-        if (s_push_probe_enabled) {
-            drivewire_push_probe_feed(b);
-        } else {
-            s_read_buf[s_read_buf_filled++] = b;
-        }
-    }
+    // A push confirmed here is received by the caller as soon as this pass
+    // returns.
+    drivewire_drain_rx();
 
     // Disarm once the budget runs out with nothing confirmed - never
     // while mid-probe (s_push_probe_state != PUSH_PROBE_IDLE), so a
@@ -1238,6 +1264,33 @@ static void drivewire_resolve_pushed_cart(void);
 // later one.
 static bool s_drop_checksum;
 
+// Throws away whatever UART1 has received and s_read_buf holds, returning
+// whether anything has gone wrong on the line since the last call: bytes were
+// waiting, or UART1 flagged a receive error (s_rx_suspect).
+// drivewire_do_write() calls it before relaying a request's last byte, when
+// the ESP32 has nothing yet to answer, so anything there is a stray - noise
+// on the line, a break (which reads as $00), or bytes left over from a
+// misaligned reply.  Kept, a stray went to the front of the next reply and
+// shifted it a byte, and where the sector ends in $00 - most FAT and
+// directory sectors do - its checksum still matched, so HDB-DOS took the
+// shifted sector and the CoCo crashed on it.  Called again before a sector's
+// checksum goes out, a true return is that sector's reply gone wrong, and
+// drivewire_do_write() drops the checksum so HDB-DOS rereads it - see
+// s_drop_checksum.  A cart-push probe's bytes are left to drivewire_do_read()
+// to settle.
+__attribute__((always_inline)) static inline bool drivewire_discard_stale(void) {
+    drivewire_drain_rx();
+    drivewire_check_uart_rx();
+    uint16_t stale = s_read_buf_filled;
+    bool suspect = s_rx_suspect;
+    s_read_buf_filled = 0;
+    s_rx_suspect = false;
+    if (stale != 0u) {
+        drivewire_error(DW_ERR_STALE_RX, stale);
+    }
+    return stale != 0u || suspect;
+}
+
 static void drivewire_do_write(uint16_t count) {
     if (count != 2u) {
         s_drop_checksum = false;
@@ -1250,10 +1303,23 @@ static void drivewire_do_write(uint16_t count) {
             // command, which it times out on.  Ordinary recovery, so not
             // recorded - see s_last_error.
             s_drop_checksum = false;
+            s_checksum_due = false;
             s_reprogram(s_active_slot, DW_KNOCK_ACK_ADDR, &s_orig_ack_byte, 1u, 1u);
             return;
         }
         uint8_t b = (uint8_t)next;
+        // A sector's checksum is decided before its first byte goes out: by
+        // the time the CoCo has summed the sector and sent this, every byte
+        // of the reply has long arrived, so one still waiting, or one that
+        // arrived flagged, means the sector is bad, and the ESP32 must answer
+        // E$CRC.  Every write also clears out strays just before its last
+        // byte - see drivewire_discard_stale().
+        if (i == 0u || i == count - 1u) {
+            bool line_trouble = drivewire_discard_stale();
+            if (line_trouble && i == 0u && count == 2u && s_checksum_due) {
+                s_drop_checksum = true;
+            }
+        }
         if (s_drop_checksum) {
             continue;
         }
@@ -1295,6 +1361,7 @@ static void drivewire_do_write(uint16_t count) {
         drivewire_uart_putc(b);
     }
     s_drop_checksum = false;
+    s_checksum_due = false;
 
     // Restore the real ROM content at the ack address now the session is
     // over - drivewire_wait_for_knock() reprogrammed it to ack this
@@ -1331,6 +1398,7 @@ static void drivewire_do_read(uint16_t count) {
     s_heartbeat = DW_STATUS_WAIT;
     s_reprogram(s_active_slot, DW_STATUS_ADDR, &s_heartbeat, 1u, 1u);
     s_drop_checksum = false;
+    s_checksum_due = false;
 
     // Settle a probe the opportunistic drain left open before collecting
     // anything: its bytes come before any still in the FIFO, and this
@@ -1431,6 +1499,10 @@ static void drivewire_do_read(uint16_t count) {
         s_read_buf[i] = (uint8_t)next;
     }
     s_read_buf_filled = 0;
+
+    // The checksum that follows a sector is where a bad one is caught - see
+    // drivewire_do_write().
+    s_checksum_due = count == sizeof(s_read_buf);
 
     s_heartbeat = 0u;  // close the heartbeat window - ready goes out next
 
@@ -2357,6 +2429,7 @@ void drivewire_main(
             // drivewire_do_load_cart()'s own comment.
             s_debug_main_phase = 4u;
             s_drop_checksum = false;
+            s_checksum_due = false;
             if (drivewire_do_load_cart()) {
                 // Success: the CoCo is about to jump into the freshly-loaded
                 // cart and run it at full speed.  Stop monitoring the ROM
@@ -2383,6 +2456,7 @@ void drivewire_main(
             // The CoCo left before sending its count - not recorded, see
             // s_last_error.
             s_drop_checksum = false;
+            s_checksum_due = false;
             s_reprogram(s_active_slot, DW_KNOCK_ACK_ADDR, &s_orig_ack_byte, 1u, 1u);
             continue;
         }
@@ -2409,6 +2483,7 @@ void drivewire_main(
             // outright rather than overrunning s_read_buf into whatever
             // static RAM happens to sit right after it.
             s_drop_checksum = false;
+            s_checksum_due = false;
             drivewire_error(DW_ERR_READ_COUNT, count);
         }
     }

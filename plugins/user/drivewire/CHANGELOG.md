@@ -1,5 +1,9 @@
 # Changelog
 
+## [1.3.1] - 2026-10-29
+
+- A noisy link to the ESP32 now makes HDB-DOS reread sectors instead of crashing the CoCo. Stray bytes no longer shift the next sector by a byte.
+
 ## [1.3.0] - 2026-10-29
 
 - Reads hand the CoCo each reply as one block, cutting a 256-byte sector from about 29 ms to 8 ms CoCo-side. Needs the matching HDB-DOS ONEROM build.

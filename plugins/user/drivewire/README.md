@@ -6,7 +6,9 @@ RP2350 UART1 hardware, instead of the CoCo's own bit-banger serial port.
 UART1 runs at 5 Mbps, well beyond what the CoCo's bit-banger port can
 reach, so the ROM-bus link to the CoCo is the bottleneck rather than the
 link to the server. The ESP32 end must run at the same rate, and
-`make BAUD=<rate>` builds the plugin for another one.
+`make BAUD=<rate>` builds the plugin for another one. At 5 Mbps the cable to
+the ESP32 should be short, with TX and RX each twisted with ground. Where it
+can't be, build both ends for 921600.
 
 This plugin is one half of the system: the other half is a modified hdbdos
 build (`dwonewrite.asm`/`dwoneread.asm`, the `ONEROM` variant) in the
@@ -98,6 +100,10 @@ A reply that stalls part way, 250 ms with bytes still to come, has lost
 bytes on the way from the ESP32. The plugin hands the CoCo what it has and
 drops the checksum the CoCo sends back, so the ESP32 answers with a checksum
 error and HDB-DOS rereads the sector instead of stopping with `?IO ERROR`.
+It does the same when UART1 flags a receive error during a sector's reply, or
+bytes are still waiting behind it when the CoCo sends the checksum. Bytes that
+arrive before a request has even been sent are strays, and the plugin throws
+them away rather than hand them to the CoCo as the start of the next reply.
 
 The read protocol must match HDB-DOS's ONEROM build: this plugin needs the
 `dwoneread.asm` that copies from the window, and the two ship together.
