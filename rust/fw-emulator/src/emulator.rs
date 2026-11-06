@@ -451,6 +451,31 @@ impl Emulator {
         ))
     }
 
+    /// `ORA_ID_LOCAL_SETUP_ADDRESS_MONITOR_ALL_CHIPS`: as
+    /// [`Self::setup_address_monitor_with_options`], capturing a read of any
+    /// chip of a multi-ROM slot.  This fork's local extension.
+    ///
+    /// # Safety
+    /// As [`Self::setup_address_monitor_with_options`].
+    pub unsafe fn setup_address_monitor_all_chips(
+        &self,
+        ring_buf: *mut u32,
+        ring_entries_log2: u8,
+        mode: ffi::ora_monitor_mode_t,
+        data_size: u8,
+        options: *const ffi::ora_address_monitor_options_t,
+    ) -> OraResult {
+        OraResult::from(plugin_call!(
+            ffi::api_id_t_ORA_ID_LOCAL_SETUP_ADDRESS_MONITOR_ALL_CHIPS,
+            ffi::ora_setup_address_monitor_all_chips_fn_t,
+            ring_buf,
+            ring_entries_log2,
+            mode,
+            data_size,
+            options
+        ))
+    }
+
     /// An `ora_address_monitor_options_t` with its size filled in and the
     /// given capture DMA priority.
     pub fn address_monitor_options(priority: u8) -> ffi::ora_address_monitor_options_t {
@@ -1066,6 +1091,125 @@ impl Emulator {
             buf.as_mut_ptr(),
             buf.len() as u32
         ))
+    }
+
+    /// `ORA_ID_LOCAL_REPROGRAM_RAM_ROM_SLOT_CHIP`: [`Self::reprogram_ram_rom_slot`]
+    /// for one chip of the slot.  This fork's local extension.
+    pub fn reprogram_ram_rom_slot_chip(
+        &self,
+        slot: u8,
+        chip: u8,
+        offset: u32,
+        buf: &[u8],
+        allow_active: bool,
+    ) -> OraResult {
+        OraResult::from(plugin_call!(
+            ffi::api_id_t_ORA_ID_LOCAL_REPROGRAM_RAM_ROM_SLOT_CHIP,
+            ffi::ora_reprogram_ram_rom_slot_chip_fn_t,
+            slot,
+            chip,
+            offset,
+            buf.as_ptr(),
+            buf.len() as u32,
+            allow_active as u8
+        ))
+    }
+
+    /// `ORA_ID_LOCAL_READ_RAM_ROM_SLOT_CHIP`: [`Self::read_ram_rom_slot`] for
+    /// one chip of the slot.  This fork's local extension.
+    pub fn read_ram_rom_slot_chip(
+        &self,
+        slot: u8,
+        chip: u8,
+        offset: u32,
+        buf: &mut [u8],
+    ) -> OraResult {
+        OraResult::from(plugin_call!(
+            ffi::api_id_t_ORA_ID_LOCAL_READ_RAM_ROM_SLOT_CHIP,
+            ffi::ora_read_ram_rom_slot_chip_fn_t,
+            slot,
+            chip,
+            offset,
+            buf.as_mut_ptr(),
+            buf.len() as u32
+        ))
+    }
+
+    /// `ORA_ID_LOCAL_DEMANGLE_ADDR_CHIP`, giving the chip read and the
+    /// address within it.  This fork's local extension.
+    pub fn demangle_addr_chip(&self, physical_addr: u32) -> (OraResult, u32, u8) {
+        let mut logical: u32 = 0;
+        let mut chip: u8 = 0;
+        let r = plugin_call!(
+            ffi::api_id_t_ORA_ID_LOCAL_DEMANGLE_ADDR_CHIP,
+            ffi::ora_demangle_addr_chip_fn_t,
+            physical_addr,
+            &mut logical as *mut u32,
+            &mut chip as *mut u8
+        );
+        (OraResult::from(r), logical, chip)
+    }
+
+    /// `ORA_ID_LOCAL_SET_X_PIN_ENABLED`.  This fork's local extension.
+    ///
+    /// `x_pin` and `enabled` are passed unchecked so a test can pass invalid
+    /// values.  On success the GPIO overrides it changed are applied to a live
+    /// epio, where [`Self::setup_epio`] has run.
+    pub fn set_x_pin_enabled(&self, x_pin: u8, enabled: u8) -> OraResult {
+        let result = OraResult::from(plugin_call!(
+            ffi::api_id_t_ORA_ID_LOCAL_SET_X_PIN_ENABLED,
+            ffi::ora_set_x_pin_enabled_fn_t,
+            x_pin,
+            enabled
+        ));
+        if result.is_ok() && !self.epio.is_null() {
+            self.sync_input_overrides();
+        }
+        result
+    }
+
+    /// Bring epio's GPIO input overrides into line with the apio record.
+    ///
+    /// `epio_update_from_apio` re-applies an override apio sets but leaves
+    /// alone one apio clears, which suits boot, where overrides are only ever
+    /// set.  An override changed at run time needs both directions.  epio
+    /// refuses a pin both inverted and forced, so each pin that differs has
+    /// all three cleared before the one it should have is set.
+    fn sync_input_overrides(&self) {
+        let epio = self.epio_or_panic();
+        // SAFETY: `_apio_emulated_gpios` is a plain C global written by the
+        // firmware under emulation; this reads it through a raw pointer without
+        // forming a reference to the `static mut`.
+        let apio = unsafe { &*core::ptr::addr_of!(ffi::_apio_emulated_gpios) };
+        for pin in 0..apio.inverted.len() as u8 {
+            let p = pin as usize;
+            let want = (
+                apio.inverted[p] != 0,
+                apio.force_input_low[p] != 0,
+                apio.force_input_high[p] != 0,
+            );
+            // SAFETY: epio is live, and pin is within the GPIOs it models.
+            unsafe {
+                let have = (
+                    ffi::epio_get_gpio_input_inverted(epio, pin) != 0,
+                    ffi::epio_get_gpio_force_input_low(epio, pin) != 0,
+                    ffi::epio_get_gpio_force_input_high(epio, pin) != 0,
+                );
+                if have == want {
+                    continue;
+                }
+                ffi::epio_set_gpio_force_input_low(epio, pin, 0);
+                ffi::epio_set_gpio_force_input_high(epio, pin, 0);
+                ffi::epio_set_gpio_input_inverted(epio, pin, 0);
+                if want.0 {
+                    ffi::epio_set_gpio_input_inverted(epio, pin, 1);
+                } else if want.1 {
+                    ffi::epio_set_gpio_force_input_low(epio, pin, 1);
+                } else if want.2 {
+                    ffi::epio_set_gpio_force_input_high(epio, pin, 1);
+                }
+            }
+        }
     }
 
     pub fn copy_flash_slot_to_ram_slot(

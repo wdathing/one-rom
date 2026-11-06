@@ -265,6 +265,61 @@ impl PinCache {
     }
 }
 
+/// The per-chip select of a Multi set's secondary chip: the one control line
+/// it does not ignore, and the level the X pin it is fly-leaded to must be
+/// driven to in order to assert it.
+///
+/// Both attributes come from one lookup because every caller must agree on
+/// which line the select is: the pio-tester marks chip0's *other* lines
+/// commoned, and drives the X pin at this line's asserted level for
+/// [`PinCache::build_secondary`].
+///
+/// Fixed CE/OE lines count. A secondary states polarity only for a
+/// mask-programmed (configurable) line - on a fixed line the config can say
+/// nothing, or `ignore`, so the level comes from the chip type via
+/// `fixed_active_level`, exactly as `PinCache::build` resolves it for a
+/// primary.
+///
+/// `None` where no line qualifies, which `check_cs_v2` rejects before a
+/// config reaches here.
+pub fn per_chip_select(secondary: &ChipConfig) -> Option<(&'static str, bool)> {
+    secondary
+        .chip_type
+        .resolved()
+        .control_lines()
+        .iter()
+        .find_map(|spec| {
+            let logic = match spec.name {
+                "ce" => secondary.ce,
+                "oe" => secondary.oe,
+                "cs1" => secondary.cs1,
+                "cs2" => secondary.cs2,
+                "cs3" => secondary.cs3,
+                "cs4" => secondary.cs4,
+                _ => return None,
+            };
+            if logic == Some(CsLogic::Ignore) {
+                return None;
+            }
+            let assert_high = match spec.line_type.fixed_active_level() {
+                // Polarity fixed by the silicon: the JEDEC CE/OE enables, and
+                // chips whose chip selects are not mask-programmable.
+                Some(active_high) => active_high,
+                // Mask-programmed at manufacture: the config states it, and a
+                // line it leaves unstated cannot be the fly-leaded select.
+                None => match logic? {
+                    CsLogic::ActiveHigh => true,
+                    CsLogic::ActiveLow => false,
+                    CsLogic::Ignore => return None,
+                    // `CsLogic` is `#[non_exhaustive]`; a polarity added to it
+                    // needs a decision here rather than a silent default.
+                    ref other => unimplemented!("unhandled CS logic {other:?}"),
+                },
+            };
+            Some((spec.name, assert_high))
+        })
+}
+
 // ── Private helpers ───────────────────────────────────────────────────────────
 
 /// Socket-pin offset to add to chip physical pin numbers.

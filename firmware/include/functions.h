@@ -113,6 +113,13 @@ extern ora_result_t pio_setup_address_monitor(
     uint8_t data_size,
     const ora_address_monitor_options_t *options
 );
+extern ora_result_t pio_setup_address_monitor_all_chips(
+    volatile uint32_t *ring_buf,
+    uint8_t ring_entries_log2,
+    ora_monitor_mode_t mode,
+    uint8_t data_size,
+    const ora_address_monitor_options_t *options
+);
 // One ROM's LED engine, in src/piodma/pioled.c.  Drives the status LED and the
 // RGB LED, including any repetition a mode calls for, so a caller sets a mode
 // once and does not tick it.  ora_led_set and ora_led_get forward here.
@@ -194,6 +201,33 @@ ora_result_t pio_reprogram_ram_rom_slot(
     const uint8_t *data,
     uint32_t len,
     uint8_t allow_active
+);
+ora_result_t pio_reprogram_ram_rom_slot_chip(
+    uint8_t slot,
+    uint8_t chip,
+    uint32_t offset,
+    const uint8_t *data,
+    uint32_t len,
+    uint8_t allow_active
+);
+ora_result_t pio_read_ram_rom_slot_chip(
+    const onerom_rom_slot_t *rom_slot,
+    uint8_t   ram_slot,
+    uint8_t   chip,
+    uint32_t  offset,
+    uint8_t  *buf,
+    uint32_t  len
+);
+ora_result_t pio_demangle_addr_chip(
+    const onerom_rom_slot_t *slot,
+    uint32_t physical_addr,
+    uint32_t *logical_addr_out,
+    uint8_t *chip_out
+);
+ora_result_t pio_set_x_pin_enabled(
+    const onerom_rom_slot_t *slot,
+    uint8_t x_pin,
+    uint8_t enabled
 );
 ora_result_t pio_start_address_monitor(void);
 volatile uint32_t * volatile *pio_get_address_monitor_ring_write_pos(void);

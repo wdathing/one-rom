@@ -195,7 +195,9 @@ static uint8_t monitor_cs_instrs(uint8_t alg) {
     }
 }
 
-static void pio_setup_address_monitor_pios() {
+// all_chips: in a Multi slot, capture a read of any of the slot's chips, not
+// chip0 alone - see pio_setup_address_monitor_all_chips().
+static void pio_setup_address_monitor_pios(uint8_t all_chips) {
     const onerom_rom_slot_t *slot = RUNTIME->current_rom_slot;
 
     // APIO_ASM_CONTINUE() rather than APIO_ASM_INIT(): this function extends
@@ -313,8 +315,11 @@ static void pio_setup_address_monitor_pios() {
             APIO_WRAP_TOP();
             APIO_ADD_INSTR(APIO_JMP_Y_DEC(APIO_LABEL(cs_releasing)));
 
-            // If multi-ROM mode, use only the first ROM's CS pins
-            if ((params->first_rom_num_cs_pins > 0) && (params->first_rom_num_cs_pins < 0xFF)) {
+            // If multi-ROM mode, use only the first ROM's CS pins, unless
+            // every chip's reads are wanted.  The whole range is what serving
+            // reads, so it captures exactly the reads One ROM answers.
+            if (!all_chips &&
+                (params->first_rom_num_cs_pins > 0) && (params->first_rom_num_cs_pins < 0xFF)) {
                 base_cs_pin = params->first_rom_cs_base;
                 num_cs_pins = params->first_rom_num_cs_pins;
             }
@@ -566,12 +571,13 @@ static void pio_setup_address_monitor_dma(
 #endif // REAL_HARDWARE
 }
 
-ora_result_t pio_setup_address_monitor(
+static ora_result_t pio_setup_address_monitor_common(
     volatile uint32_t *ring_buf,
     uint8_t ring_entries_log2,
     ora_monitor_mode_t mode,
     uint8_t data_size,
-    const ora_address_monitor_options_t *options
+    const ora_address_monitor_options_t *options,
+    uint8_t all_chips
 ) {
     (void)mode;
 
@@ -600,7 +606,7 @@ ora_result_t pio_setup_address_monitor(
         return ORA_RESULT_INVALID_SIZE;
     }
 
-    pio_setup_address_monitor_pios();
+    pio_setup_address_monitor_pios(all_chips);
     pio_setup_address_monitor_dma(
         DMA_CH_ADDR_MONITOR,
         // The address-read monitor SM shares the ROM serving address block; the
@@ -614,6 +620,33 @@ ora_result_t pio_setup_address_monitor(
     );
 
     return ORA_RESULT_OK;
+}
+
+// The address monitor as upstream defines it: in a Multi slot, chip0's reads
+// only.
+ora_result_t pio_setup_address_monitor(
+    volatile uint32_t *ring_buf,
+    uint8_t ring_entries_log2,
+    ora_monitor_mode_t mode,
+    uint8_t data_size,
+    const ora_address_monitor_options_t *options
+) {
+    return pio_setup_address_monitor_common(
+        ring_buf, ring_entries_log2, mode, data_size, options, 0u);
+}
+
+// The address monitor capturing a read of any chip in a Multi slot, which
+// pio_demangle_addr_chip() then attributes.  Elsewhere the same as
+// pio_setup_address_monitor().
+ora_result_t pio_setup_address_monitor_all_chips(
+    volatile uint32_t *ring_buf,
+    uint8_t ring_entries_log2,
+    ora_monitor_mode_t mode,
+    uint8_t data_size,
+    const ora_address_monitor_options_t *options
+) {
+    return pio_setup_address_monitor_common(
+        ring_buf, ring_entries_log2, mode, data_size, options, 1u);
 }
 
 // Maps a logical chip address (host-visible A_n values, chip0) to the SRAM
@@ -653,57 +686,6 @@ ora_result_t pio_setup_address_monitor(
 // Step 3: Banked X bits.
 //   Currently targets bank 0 only (X bits remain 0).
 //   TODO: add explicit bank selection when required.
-// Bit positions within [0, num_addr_pins) that pio_map_addr_to_phys()'s own
-// address-bit loop never sets for this slot's chip type - i.e. GPIOs that
-// fall inside the contiguous capture span (addr_base .. addr_base +
-// num_addr_pins - 1) purely because the span is sampled as one block, but
-// aren't wired to a real address line for THIS chip (e.g. VPP on a 27128,
-// which a board's socket may still list as an address pin for a larger
-// chip type the same socket also supports - see fire-28-c.json's "addr"
-// list vs. a given chip-type's own, shorter pin count). A live read's
-// physical index includes whatever that pin actually reads as, which
-// nothing here drives or defines - so a byte stored at only one combination
-// of these bits is correct for exactly one of the 2^N physically-reachable
-// locations a real access could land on, and wrong for the others,
-// depending on what that floating pin happens to read.
-//
-// Deliberately independent of pio_get_unobserved_addr_bits(): its own doc
-// comment scopes it to low-order/LSB-omitted bits (the word-mode A-1 case),
-// not a gap that can fall anywhere within the span, so it is not assumed
-// to describe this case correctly. This instead derives the mask directly
-// from the same pin_map->addr[] scan pio_map_addr_to_phys() itself uses.
-//
-// Restricted to slot types pio_map_addr_to_phys() never sets any other
-// bit for within the address span: Multi sets CS bits there (Step 2) and
-// Banked reserves bits for X (Step 3), both computed the same
-// gpio - addr_base way a real gap bit is, and this function has no way to
-// tell a real CS/X bit apart from an actual gap without duplicating that
-// logic here too. Returning 0 (no-op - exactly the prior, single-write
-// behaviour) for those leaves them untouched rather than risk writing a
-// Multi/Banked slot's real selector bits as if they were free to toggle.
-static uint32_t pio_addr_gap_mask(const onerom_rom_slot_t *slot) {
-    if (slot->slot_type == ROM_SLOT_TYPE_MULTI_ROM ||
-        slot->slot_type == ROM_SLOT_TYPE_BANKED_ROM) {
-        return 0;
-    }
-
-    const onerom_alg_addr_config_t *addr_alg = slot->alg->alg_addr;
-    const onerom_rom_pin_map_t     *pin_map  = slot->roms[0]->pin_map;
-    uint8_t  addr_base = addr_alg->gpio_base + addr_alg->base_addr_pin;
-    uint32_t occupied = 0;
-
-    for (uint8_t n = 0; n < MAX_ADDR_PINS; n++) {
-        uint8_t gpio = pin_map->addr[n];
-        if (gpio >= GPIO_NONE) break;
-        occupied |= (1u << (gpio - addr_base));
-    }
-
-    uint32_t full = (addr_alg->num_addr_pins >= 32u)
-                        ? 0xFFFFFFFFu
-                        : ((1u << addr_alg->num_addr_pins) - 1u);
-    return full & ~occupied;
-}
-
 uint32_t pio_map_addr_to_phys(
     const onerom_rom_slot_t *slot,
     uint32_t logical_addr
@@ -833,6 +815,351 @@ uint32_t pio_map_addr_to_phys(
     }
 
     return physical;
+}
+
+// The span bits X pin x_pin (1 or 2) appears at.  A board can wire an X pin to
+// two GPIOs, and the address span can hold either or both.  Both read the same
+// net, so a real read always has them equal, and they are set together.
+static uint32_t pio_x_pin_span_bits(
+    uint8_t x_pin,
+    uint8_t addr_base,
+    uint8_t num_addr_pins
+) {
+    const uint8_t *gpios = (x_pin == 1u) ? HW->gpio_x1 : HW->gpio_x2;
+    uint32_t bits = 0;
+    for (uint8_t j = 0; j < MAX_X_PIN_GPIOS; j++) {
+        uint8_t g = gpios[j];
+        if (g >= addr_base && g < (uint8_t)(addr_base + num_addr_pins)) {
+            bits |= 1u << (g - addr_base);
+        }
+    }
+    return bits;
+}
+
+// The span bits that choose the chip in a Multi slot, one-hot, as the
+// generator's build_rom_image() (rust/gen/src/v2/rom_image.rs) reads them:
+// chip0's per-chip select, then X1 and X2.  X2 is 0 for a 2 chip slot.
+typedef struct {
+    uint32_t chip[3];
+} multi_select_bits_t;
+
+static ora_result_t pio_multi_select_bits(
+    const onerom_rom_slot_t *slot,
+    multi_select_bits_t *out
+) {
+    const onerom_alg_addr_config_t *addr_alg = slot->alg->alg_addr;
+    const onerom_alg_cs_config_t   *cs_alg   = slot->alg->alg_cs;
+    uint8_t addr_base = addr_alg->gpio_base + addr_alg->base_addr_pin;
+
+    // The generator only builds Multi slots with AlgCs0 - see the Step 2
+    // comment on pio_map_addr_to_phys().
+    if (cs_alg->alg != ALG_CS_0) {
+        return ORA_RESULT_INTERNAL_ERROR;
+    }
+    const onerom_alg_cs0_param_t *cs_params =
+        (const onerom_alg_cs0_param_t *)cs_alg->params;
+    uint8_t cs1_gpio = cs_alg->gpio_base + cs_params->first_rom_cs_base;
+
+    out->chip[0] = 1u << (cs1_gpio - addr_base);
+    out->chip[1] = pio_x_pin_span_bits(1u, addr_base, addr_alg->num_addr_pins);
+    out->chip[2] = (slot->rom_count >= 3u)
+        ? pio_x_pin_span_bits(2u, addr_base, addr_alg->num_addr_pins)
+        : 0u;
+    return ORA_RESULT_OK;
+}
+
+// How many of chip0's address lines chip `chip` has: all of them for chip0,
+// and for a smaller chip further into a Multi slot, enough for its size.  The
+// rest are not connected to it.
+static uint8_t pio_chip_addr_lines(const onerom_rom_slot_t *slot, uint8_t chip) {
+    const onerom_rom_pin_map_t *pin_map = slot->roms[0]->pin_map;
+    uint8_t lines = 0;
+    while (lines < MAX_ADDR_PINS && pin_map->addr[lines] < GPIO_NONE) {
+        lines++;
+    }
+    if (chip != 0u) {
+        uint32_t size = slot->roms[chip]->chip_size;
+        uint8_t own = 0;
+        while (own < lines && (1u << own) < size) {
+            own++;
+        }
+        lines = own;
+    }
+    return lines;
+}
+
+// Where chip `chip` of `slot` keeps a byte in a RAM slot's table, as masks
+// over the table index pio_map_addr_to_phys() produces.  The generator,
+// build_rom_image(), stores a byte at every index a real read of it can
+// produce, not at one of them, and a write that is to be read back by the host
+// must do the same.
+//
+// An index bit is fixed when a read sets it, and free when the byte is the same
+// whatever it reads.  Fixed are the chip's address lines, the select lines -
+// the CS range, 0, in a Single or Banked slot, plus a Banked slot's X pins at
+// bank 0, and in a Multi slot chip0's per-chip select and the X pins, one-hot -
+// and any GPIO an override holds at one level.  Everything else in the span is
+// free: a gap no address line of this chip uses (VPP on a 27128), chip0's
+// address lines above a smaller chip's range, and a Multi slot's commoned or
+// ignored control lines.
+typedef struct {
+    // Bits to clear from pio_map_addr_to_phys()'s result.
+    uint32_t clear;
+    // Bits to then set, giving the index with every free bit 0.
+    uint32_t set;
+    // The free bits.  Every combination of them holds the same byte.
+    uint32_t free;
+} chip_table_masks_t;
+
+static ora_result_t pio_chip_table_masks(
+    const onerom_rom_slot_t *slot,
+    uint8_t chip,
+    chip_table_masks_t *out
+) {
+    if (chip >= slot->rom_count) {
+        return ORA_RESULT_INVALID_ARG;
+    }
+
+    const onerom_alg_addr_config_t *addr_alg = slot->alg->alg_addr;
+    const onerom_alg_cs_config_t   *cs_alg   = slot->alg->alg_cs;
+    const onerom_rom_pin_map_t     *pin_map  = slot->roms[0]->pin_map;
+    uint8_t  addr_base = addr_alg->gpio_base + addr_alg->base_addr_pin;
+    uint8_t  num_addr  = addr_alg->num_addr_pins;
+    uint32_t span      = (num_addr >= 32u) ? 0xFFFFFFFFu : ((1u << num_addr) - 1u);
+    uint8_t  multi     = (slot->slot_type == ROM_SLOT_TYPE_MULTI_ROM);
+    uint8_t  word_16   = (slot->alg->alg_data->word_size == 16u);
+
+    // No board serves a 16-bit chip from a Multi slot, so the generator never
+    // builds one, and the one-hot selection below has no 16-bit form.
+    if (multi && word_16) {
+        return ORA_RESULT_NOT_SUPPORTED;
+    }
+
+    uint32_t fixed = 0;
+    uint32_t set   = 0;
+    uint32_t clear = 0;
+
+    uint8_t lines = pio_chip_addr_lines(slot, chip);
+    for (uint8_t n = 0; n < lines; n++) {
+        fixed |= 1u << (pin_map->addr[n] - addr_base);
+    }
+
+    if (multi) {
+        multi_select_bits_t sel;
+        ora_result_t result = pio_multi_select_bits(slot, &sel);
+        if (result != ORA_RESULT_OK) {
+            return result;
+        }
+        uint32_t all = sel.chip[0] | sel.chip[1] | sel.chip[2];
+        fixed |= all;
+        clear |= all;
+        set   |= sel.chip[chip];
+    } else {
+        uint8_t cs_base = cs_alg->gpio_base + cs_alg->base_cs_pin;
+        for (uint8_t i = 0; i < cs_alg->num_cs_pins; i++) {
+            uint8_t g = cs_base + i;
+            if (g >= addr_base && g < (uint8_t)(addr_base + num_addr)) {
+                fixed |= 1u << (g - addr_base);
+            }
+        }
+        if (slot->slot_type == ROM_SLOT_TYPE_BANKED_ROM) {
+            fixed |= pio_x_pin_span_bits(1u, addr_base, num_addr) |
+                     pio_x_pin_span_bits(2u, addr_base, num_addr);
+        }
+    }
+
+    // A GPIO an override holds at one level reads only that level.
+    const onerom_alg_override_config_t *ovr = slot->alg->gpio_override_config;
+    if (ovr != NULL && ovr != (const onerom_alg_override_config_t *)0xFFFFFFFF) {
+        for (uint8_t i = 0; i < ovr->param_len; i++) {
+            uint8_t g    = ovr->params[i] & 0x3Fu;
+            uint8_t mode = (ovr->params[i] >> 6u) & 0x03u;
+            if (g < addr_base || g >= (uint8_t)(addr_base + num_addr)) {
+                continue;
+            }
+            uint32_t bit = 1u << (g - addr_base);
+            if ((fixed & bit) != 0u) {
+                continue;
+            }
+            if (mode == GPIO_OVER_LOW) {
+                fixed |= bit;
+                clear |= bit;
+            } else if (mode == GPIO_OVER_HIGH) {
+                fixed |= bit;
+                set   |= bit;
+            }
+        }
+    }
+
+    uint32_t free = span & ~fixed;
+    clear |= free;
+
+    // pio_map_addr_to_phys() puts A-1 at bit 0 and the span above it.
+    if (word_16) {
+        clear <<= 1;
+        set   <<= 1;
+        free  <<= 1;
+    }
+
+    out->clear = clear;
+    out->set   = set;
+    out->free  = free;
+    return ORA_RESULT_OK;
+}
+
+// The table index holding chip `chip`'s byte at logical_addr, with every free
+// bit 0.
+static inline uint32_t pio_chip_table_index(
+    const onerom_rom_slot_t *slot,
+    const chip_table_masks_t *masks,
+    uint32_t logical_addr
+) {
+    return (pio_map_addr_to_phys(slot, logical_addr) & ~masks->clear) | masks->set;
+}
+
+// The chip a Multi slot read selected, and the address it read within that
+// chip.  A Single or Banked slot has only chip 0, and this is
+// pio_demangle_addr() with its control pin check.
+ora_result_t pio_demangle_addr_chip(
+    const onerom_rom_slot_t *slot,
+    uint32_t physical_addr,
+    uint32_t *logical_addr_out,
+    uint8_t *chip_out
+) {
+    if (logical_addr_out == NULL || chip_out == NULL) {
+        return ORA_RESULT_INVALID_ARG;
+    }
+
+    if (slot->slot_type != ROM_SLOT_TYPE_MULTI_ROM) {
+        ora_result_t result = pio_demangle_addr(slot, physical_addr, logical_addr_out, 1u);
+        if (result == ORA_RESULT_OK) {
+            *chip_out = 0u;
+        }
+        return result;
+    }
+
+    // As pio_chip_table_masks().
+    if (slot->alg->alg_data->word_size == 16u) {
+        return ORA_RESULT_NOT_SUPPORTED;
+    }
+
+    multi_select_bits_t sel;
+    ora_result_t result = pio_multi_select_bits(slot, &sel);
+    if (result != ORA_RESULT_OK) {
+        return result;
+    }
+
+    // Exactly one chip selected, or none was read.
+    uint8_t chip = 0xFFu;
+    for (uint8_t i = 0; i < slot->rom_count && i < 3u; i++) {
+        uint32_t bits = sel.chip[i];
+        if (bits != 0u && (physical_addr & bits) == bits) {
+            if (chip != 0xFFu) {
+                return ORA_RESULT_CONTROL_PIN_ACTIVE;
+            }
+            chip = i;
+        }
+    }
+    if (chip == 0xFFu) {
+        return ORA_RESULT_CONTROL_PIN_ACTIVE;
+    }
+
+    uint32_t logical;
+    result = pio_demangle_addr(slot, physical_addr, &logical, 0u);
+    if (result != ORA_RESULT_OK) {
+        return result;
+    }
+
+    // chip0 address lines the chip doesn't have carry nothing for it.
+    uint8_t lines = pio_chip_addr_lines(slot, chip);
+    if (lines < 32u) {
+        logical &= (1u << lines) - 1u;
+    }
+
+    *logical_addr_out = logical;
+    *chip_out = chip;
+    return ORA_RESULT_OK;
+}
+
+// Sets gpio's input override to ovr, one of the APIO_GPIO_CTRL_INOVER_*
+// values or 0 for none, in a single store.  apio's APIO_GPIO_INPUT_INVERT and
+// APIO_GPIO_FORCE_INPUT_* clear the field and then set it, which leaves the
+// input un-overridden for a moment - harmless at boot, but on a pin a running
+// PIO program reads, an active-low select can read as active in between.
+static void pio_set_input_override(uint8_t gpio, uint32_t ovr) {
+#if !defined(APIO_EMULATION)
+    APIO_GPIO_CTRL(gpio) = (APIO_GPIO_CTRL(gpio) & ~APIO_GPIO_CTRL_INOVER_MASK) |
+                           (ovr & APIO_GPIO_CTRL_INOVER_MASK);
+#else // APIO_EMULATION
+    _apio_emulated_gpios.inverted[gpio]         = (ovr == APIO_GPIO_CTRL_INOVER_INVERT);
+    _apio_emulated_gpios.force_input_low[gpio]  = (ovr == APIO_GPIO_CTRL_INOVER_LOW);
+    _apio_emulated_gpios.force_input_high[gpio] = (ovr == APIO_GPIO_CTRL_INOVER_HIGH);
+#endif // !APIO_EMULATION
+}
+
+// Takes One ROM's answer to X pin x_pin's chip select away, or gives it back.
+//
+// Each GPIO the X pin is wired to has its input forced low, which every
+// serving and monitoring PIO program reads as that chip not selected, so One
+// ROM leaves the data bus alone while it is selected.  Enabling restores the
+// override the slot configured.  A CS-range GPIO - the one the chip select
+// state machine reads - is forced first and restored last, so that machine
+// never sees the X pin selected while the address machine's copy still reads
+// it forced.
+ora_result_t pio_set_x_pin_enabled(
+    const onerom_rom_slot_t *slot,
+    uint8_t x_pin,
+    uint8_t enabled
+) {
+    if (slot->slot_type != ROM_SLOT_TYPE_MULTI_ROM) {
+        return ORA_RESULT_NOT_SUPPORTED;
+    }
+    // X pin n selects chip n.
+    if (x_pin < 1u || x_pin > 2u || x_pin >= slot->rom_count || enabled > 1u) {
+        return ORA_RESULT_INVALID_ARG;
+    }
+
+    const onerom_alg_cs_config_t *cs_alg = slot->alg->alg_cs;
+    uint8_t cs_base = cs_alg->gpio_base + cs_alg->base_cs_pin;
+    uint8_t cs_end  = cs_base + cs_alg->num_cs_pins;
+    const uint8_t *gpios = (x_pin == 1u) ? HW->gpio_x1 : HW->gpio_x2;
+
+    // Pass 0 takes the CS-range GPIOs when disabling and the rest when
+    // enabling; pass 1 the other way round.
+    for (uint8_t pass = 0; pass < 2u; pass++) {
+        uint8_t want_cs = (pass == 0u) ? !enabled : enabled;
+        for (uint8_t j = 0; j < MAX_X_PIN_GPIOS; j++) {
+            uint8_t g = gpios[j];
+            if (g >= MAX_GPIOS) {
+                continue;
+            }
+            uint8_t in_cs = (g >= cs_base && g < cs_end);
+            if (in_cs != want_cs) {
+                continue;
+            }
+
+            uint32_t ovr = APIO_GPIO_CTRL_INOVER_LOW;
+            if (enabled) {
+                switch (v2_get_gpio_override(slot, g)) {
+                    case GPIO_OVER_INVERT:
+                        ovr = APIO_GPIO_CTRL_INOVER_INVERT;
+                        break;
+                    case GPIO_OVER_LOW:
+                        ovr = APIO_GPIO_CTRL_INOVER_LOW;
+                        break;
+                    case GPIO_OVER_HIGH:
+                        ovr = APIO_GPIO_CTRL_INOVER_HIGH;
+                        break;
+                    default:
+                        ovr = 0u;
+                        break;
+                }
+            }
+            pio_set_input_override(g, ovr);
+        }
+    }
+
+    return ORA_RESULT_OK;
 }
 
 // Maps a logical data byte to the physical byte to store in the SRAM table.
@@ -1388,14 +1715,61 @@ uint8_t *sram_to_host(uint32_t addr) {
 }
 #endif
 
-// Reads a contiguous logical region of a RAM slot into buf, reversing the
-// address and data mappings.  Counterpart to pio_reprogram_ram_rom_slot.
+// Reads a contiguous logical region of chip `chip` in a RAM slot into buf,
+// reversing the address and data mappings.  Counterpart to
+// pio_reprogram_chip().
 //
 // rom_slot provides the pin map and algorithm config for the mappings.
-// ram_slot is the RAM slot index to read from.
+// ram_slot is the RAM slot index to read from.  The region must end within
+// `limit` bytes, as well as within the RAM slot.
 //
 // Reads are always permitted from the active slot; no allow_active flag is
 // needed (the caller is responsible for any consistency requirements).
+static ora_result_t pio_read_chip(
+    const onerom_rom_slot_t *rom_slot,
+    uint8_t   ram_slot,
+    uint8_t   chip,
+    uint32_t  offset,
+    uint8_t  *buf,
+    uint32_t  len,
+    uint32_t  limit
+) {
+    if (buf == NULL || len == 0u) {
+        return ORA_RESULT_INVALID_ARG;
+    }
+
+    uint32_t     addr, size;
+    ora_result_t result = ora_get_ram_slot_info(ram_slot, &addr, &size, NULL);
+    if (result != ORA_RESULT_OK) {
+        return result;
+    }
+
+    if (offset + len > size || len > limit || offset > limit - len) {
+        return ORA_RESULT_INVALID_ARG;
+    }
+
+    chip_table_masks_t masks;
+    result = pio_chip_table_masks(rom_slot, chip, &masks);
+    if (result != ORA_RESULT_OK) {
+        return result;
+    }
+
+#if REAL_HARDWARE
+    const uint8_t *sram = (const uint8_t *)(uintptr_t)addr;
+#else
+    const uint8_t *sram = sram_to_host(addr);
+#endif
+    // Every combination of the free bits holds the same byte, so the one with
+    // them all 0 is as good as any.
+    for (uint32_t i = 0u; i < len; i++) {
+        uint32_t physical_offset = pio_chip_table_index(rom_slot, &masks, offset + i);
+        buf[i] = pio_demangle_data(rom_slot, sram[physical_offset]);
+    }
+
+    return ORA_RESULT_OK;
+}
+
+// pio_read_chip() on chip 0, bounded by the RAM slot alone.
 ora_result_t pio_read_ram_rom_slot(
     const onerom_rom_slot_t *rom_slot,
     uint8_t   ram_slot,
@@ -1403,31 +1777,23 @@ ora_result_t pio_read_ram_rom_slot(
     uint8_t  *buf,
     uint32_t  len
 ) {
-    if (buf == NULL || len == 0u) {
+    return pio_read_chip(rom_slot, ram_slot, 0u, offset, buf, len, 0xFFFFFFFFu);
+}
+
+// pio_read_chip() on any chip, bounded by that chip's size.
+ora_result_t pio_read_ram_rom_slot_chip(
+    const onerom_rom_slot_t *rom_slot,
+    uint8_t   ram_slot,
+    uint8_t   chip,
+    uint32_t  offset,
+    uint8_t  *buf,
+    uint32_t  len
+) {
+    if (chip >= rom_slot->rom_count) {
         return ORA_RESULT_INVALID_ARG;
     }
- 
-    uint32_t     addr, size;
-    ora_result_t result = ora_get_ram_slot_info(ram_slot, &addr, &size, NULL);
-    if (result != ORA_RESULT_OK) {
-        return result;
-    }
- 
-    if (offset + len > size) {
-        return ORA_RESULT_INVALID_ARG;
-    }
- 
-#if REAL_HARDWARE
-    const uint8_t *sram = (const uint8_t *)(uintptr_t)addr;
-#else
-    const uint8_t *sram = sram_to_host(addr);
-#endif
-    for (uint32_t i = 0u; i < len; i++) {
-        uint32_t physical_offset = pio_map_addr_to_phys(rom_slot, offset + i);
-        buf[i] = pio_demangle_data(rom_slot, sram[physical_offset]);
-    }
- 
-    return ORA_RESULT_OK;
+    return pio_read_chip(rom_slot, ram_slot, chip, offset, buf, len,
+                         rom_slot->roms[chip]->chip_size);
 }
 
 __attribute__((always_inline)) static inline uint8_t debounce(
@@ -1550,12 +1916,16 @@ ora_result_t pio_wait_for_knock(
     return ORA_RESULT_OK;
 }
 
-ora_result_t pio_reprogram_ram_rom_slot(
+// Writes a contiguous logical region of chip `chip` in RAM slot `slot`, which
+// must end within `limit` bytes as well as within the RAM slot.
+static ora_result_t pio_reprogram_chip(
     uint8_t slot,
+    uint8_t chip,
     uint32_t offset,
     const uint8_t *data,
     uint32_t len,
-    uint8_t allow_active
+    uint8_t allow_active,
+    uint32_t limit
 ) {
     if (data == NULL || len == 0) {
         return ORA_RESULT_INVALID_ARG;
@@ -1568,9 +1938,15 @@ ora_result_t pio_reprogram_ram_rom_slot(
         return result;
     }
 
-    // Check the write stays within the slot
-    if (offset + len > size) {
+    // Check the write stays within the slot and the chip
+    if (offset + len > size || len > limit || offset > limit - len) {
         return ORA_RESULT_INVALID_ARG;
+    }
+
+    chip_table_masks_t masks;
+    result = pio_chip_table_masks(CURRENT_SLOT, chip, &masks);
+    if (result != ORA_RESULT_OK) {
+        return result;
     }
 
     // If allow_active is not set, refuse to write to the currently active slot
@@ -1589,20 +1965,15 @@ ora_result_t pio_reprogram_ram_rom_slot(
 #else
     uint8_t *sram = sram_to_host(addr);
 #endif
-    // gap_mask's bits are address-span positions pio_map_addr_to_phys()
-    // never sets - see pio_addr_gap_mask()'s own comment. base_phys always
-    // has them at 0; writing every byte to every combination of them too
-    // (the classic "enumerate all submasks" descent: combo starts at
-    // gap_mask, each step takes (combo-1) & gap_mask, terminating after 0
-    // is processed) means a live read lands on the right data no matter
-    // what a gap bit's undriven GPIO happens to read as. gap_mask is 0 for
-    // every chip type that doesn't have one, so this is a single iteration
-    // (the prior behaviour) in the common case.
-    uint32_t gap_mask = pio_addr_gap_mask(CURRENT_SLOT);
+    // Each byte goes to every combination of the free bits - see
+    // pio_chip_table_masks() - so a live read lands on it whatever those
+    // GPIOs read.  The descent visits every submask of masks.free, starting
+    // at the whole mask and ending after 0.  With no free bits it is one
+    // write.
     for (uint32_t i = 0; i < len; i++) {
-        uint32_t base_phys    = pio_map_addr_to_phys(CURRENT_SLOT, offset + i);
+        uint32_t base_phys    = pio_chip_table_index(CURRENT_SLOT, &masks, offset + i);
         uint8_t  physical_data = pio_map_data_to_phys(CURRENT_SLOT, data[i]);
-        uint32_t combo = gap_mask;
+        uint32_t combo = masks.free;
         for (;;) {
             uint32_t physical_addr = base_phys | combo;
             sram[physical_addr] = physical_data;
@@ -1614,11 +1985,38 @@ ora_result_t pio_reprogram_ram_rom_slot(
             }
 #endif
             if (combo == 0) break;
-            combo = (combo - 1) & gap_mask;
+            combo = (combo - 1) & masks.free;
         }
     }
 
     return ORA_RESULT_OK;
+}
+
+// pio_reprogram_chip() on chip 0, bounded by the RAM slot alone.
+ora_result_t pio_reprogram_ram_rom_slot(
+    uint8_t slot,
+    uint32_t offset,
+    const uint8_t *data,
+    uint32_t len,
+    uint8_t allow_active
+) {
+    return pio_reprogram_chip(slot, 0u, offset, data, len, allow_active, 0xFFFFFFFFu);
+}
+
+// pio_reprogram_chip() on any chip, bounded by that chip's size.
+ora_result_t pio_reprogram_ram_rom_slot_chip(
+    uint8_t slot,
+    uint8_t chip,
+    uint32_t offset,
+    const uint8_t *data,
+    uint32_t len,
+    uint8_t allow_active
+) {
+    if (chip >= CURRENT_SLOT->rom_count) {
+        return ORA_RESULT_INVALID_ARG;
+    }
+    return pio_reprogram_chip(slot, chip, offset, data, len, allow_active,
+                              CURRENT_SLOT->roms[chip]->chip_size);
 }
 
 ora_result_t pio_start_address_monitor(void) {

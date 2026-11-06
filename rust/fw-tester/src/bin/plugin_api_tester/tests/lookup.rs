@@ -219,6 +219,27 @@ pub fn test_lookup_coverage(emu: &Emulator, base_dir: &Path) -> Result<(), Strin
             "ORA_ID_FIRMWARE_STATE_QUERY",
         ),
         (ffi::api_id_t_ORA_ID_SET_STANDBY, "ORA_ID_SET_STANDBY"),
+        // This fork's local extensions - see tests/multi.rs.
+        (
+            ffi::api_id_t_ORA_ID_LOCAL_SET_X_PIN_ENABLED,
+            "ORA_ID_LOCAL_SET_X_PIN_ENABLED",
+        ),
+        (
+            ffi::api_id_t_ORA_ID_LOCAL_REPROGRAM_RAM_ROM_SLOT_CHIP,
+            "ORA_ID_LOCAL_REPROGRAM_RAM_ROM_SLOT_CHIP",
+        ),
+        (
+            ffi::api_id_t_ORA_ID_LOCAL_READ_RAM_ROM_SLOT_CHIP,
+            "ORA_ID_LOCAL_READ_RAM_ROM_SLOT_CHIP",
+        ),
+        (
+            ffi::api_id_t_ORA_ID_LOCAL_DEMANGLE_ADDR_CHIP,
+            "ORA_ID_LOCAL_DEMANGLE_ADDR_CHIP",
+        ),
+        (
+            ffi::api_id_t_ORA_ID_LOCAL_SETUP_ADDRESS_MONITOR_ALL_CHIPS,
+            "ORA_ID_LOCAL_SETUP_ADDRESS_MONITOR_ALL_CHIPS",
+        ),
     ];
 
     // Deprecated/invalid IDs — must resolve to null.

@@ -265,6 +265,15 @@ fn main() {
         .allowlist_function("epio_read_pull_down_pins")
         .allowlist_function("epio_disassemble_sm")
         .allowlist_function("epio_get_gpio_input_inverted")
+        // epio applies a GPIO's input override from apio only one way - it sets
+        // what apio sets and never clears what apio clears - so an override
+        // the firmware changes at run time is synced by hand.  See
+        // Emulator::sync_input_overrides.
+        .allowlist_function("epio_set_gpio_input_inverted")
+        .allowlist_function("epio_set_gpio_force_input_low")
+        .allowlist_function("epio_set_gpio_force_input_high")
+        .allowlist_function("epio_get_gpio_force_input_low")
+        .allowlist_function("epio_get_gpio_force_input_high")
         .allowlist_function("set_host_sram_ptr")
         .allowlist_function("stub_set_sel_image")
         .allowlist_function("stub_set_rp_variant")

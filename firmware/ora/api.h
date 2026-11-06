@@ -797,6 +797,51 @@ typedef enum {
      */
     ORA_ID_SET_STANDBY               = 0x00000040,
 
+    /*
+     * Local extensions, carried in this fork and not in upstream One ROM.
+     *
+     * Numbered from 0x00010000, far from upstream's sequence, so that upstream
+     * assigning its next IDs can never give one of these numbers a different
+     * function: on upstream firmware each looks up as NULL, which a plugin
+     * must handle.  If upstream adopts one, it takes upstream's number and the
+     * local ID goes.
+     */
+
+    /**
+     * @brief Stop or restart answering an X pin's chip select
+     * @sa ora_set_x_pin_enabled_fn_t
+     * @since firmware 0.8.0, local extension
+     */
+    ORA_ID_LOCAL_SET_X_PIN_ENABLED           = 0x00010000,
+
+    /**
+     * @brief Reprogram one chip of the selected RAM ROM slot
+     * @sa ora_reprogram_ram_rom_slot_chip_fn_t
+     * @since firmware 0.8.0, local extension
+     */
+    ORA_ID_LOCAL_REPROGRAM_RAM_ROM_SLOT_CHIP = 0x00010001,
+
+    /**
+     * @brief Read one chip of a RAM ROM slot
+     * @sa ora_read_ram_rom_slot_chip_fn_t
+     * @since firmware 0.8.0, local extension
+     */
+    ORA_ID_LOCAL_READ_RAM_ROM_SLOT_CHIP      = 0x00010002,
+
+    /**
+     * @brief Demangle a physical address to a chip and its logical address
+     * @sa ora_demangle_addr_chip_fn_t
+     * @since firmware 0.8.0, local extension
+     */
+    ORA_ID_LOCAL_DEMANGLE_ADDR_CHIP          = 0x00010003,
+
+    /**
+     * @brief Set up the address monitor to capture a read of any chip
+     * @sa ora_setup_address_monitor_all_chips_fn_t
+     * @since firmware 0.8.0, local extension
+     */
+    ORA_ID_LOCAL_SETUP_ADDRESS_MONITOR_ALL_CHIPS = 0x00010004,
+
     /** Invalid API identifier */
     ORA_ID_INVALID = 0xFFFFFFFF,
 } api_id_t;
@@ -3393,6 +3438,136 @@ typedef ora_result_t (*ora_firmware_state_query_fn_t)(
  *         ORA_RESULT_INVALID_ARG if @p standby is neither 0 nor 1.
  */
 typedef ora_result_t (*ora_set_standby_fn_t)(uint8_t standby, uint32_t flags);
+
+/**
+ * @brief Stop or restart answering an X pin's chip select
+ * @sa ORA_ID_LOCAL_SET_X_PIN_ENABLED
+ * @since firmware 0.8.0, local extension
+ *
+ * In a multi-ROM slot, X pin n selects chip n.  Disabled, One ROM treats that
+ * chip as never selected: it leaves the data bus alone while the line is
+ * active, so another device sharing that select - a cartridge, say - can
+ * answer instead, and the address monitor stops capturing the chip's reads.
+ * The other chips are served as before.  Enabling it serves the chip again.
+ *
+ * Each GPIO the X pin is wired to has its input forced low, so whatever is
+ * connected to the pin keeps driving it; nothing is driven back.  The setting
+ * lasts until changed or until One ROM reboots, and switching the active RAM
+ * slot leaves it as it is.
+ *
+ * @param x_pin    1 or 2, an X pin the slot uses
+ * @param enabled  1 to answer the X pin's chip select, 0 to stop
+ * @return ORA_RESULT_OK on success, including when the X pin is already in
+ *         the requested state.
+ *         ORA_RESULT_NOT_SUPPORTED if the slot being served isn't a multi-ROM
+ *         slot.
+ *         ORA_RESULT_INVALID_ARG if @p x_pin isn't one the slot uses, or
+ *         @p enabled is neither 0 nor 1.
+ */
+typedef ora_result_t (*ora_set_x_pin_enabled_fn_t)(uint8_t x_pin, uint8_t enabled);
+
+/**
+ * @brief Reprogram one chip of the selected RAM ROM slot
+ * @sa ORA_ID_LOCAL_REPROGRAM_RAM_ROM_SLOT_CHIP
+ * @since firmware 0.8.0, local extension
+ *
+ * As @ref ora_reprogram_ram_rom_slot_fn_t, for chip @p chip of the slot being
+ * served: 0 is the chip One ROM sits in place of, and in a multi-ROM slot 1 and
+ * 2 are those on X1 and X2.  @p offset and @p len are within that chip, and the
+ * write must end within its size.
+ *
+ * Each byte is written to every table entry a read of it can reach, so a host
+ * reads it back whatever the address lines the chip doesn't have, and any
+ * unused GPIO inside the address window, are doing.
+ *
+ * @param slot          RAM ROM slot to update
+ * @param chip          Chip within the slot
+ * @param offset        Logical start address within the chip
+ * @param buf           Pointer to the logical data bytes to write
+ * @param len           Number of bytes to write
+ * @param allow_active  If non-zero, allow writing to the RAM slot being served
+ * @return ORA_RESULT_OK on success.
+ *         ORA_RESULT_INVALID_ARG if @p buf is NULL, @p len is zero, @p chip
+ *         isn't in the slot, or the write doesn't end within the chip and the
+ *         RAM slot.
+ *         ORA_RESULT_INVALID_SLOT if @p slot is out of range.
+ *         ORA_RESULT_SLOT_ACTIVE if @p slot is being served and
+ *         @p allow_active is zero.
+ */
+typedef ora_result_t (*ora_reprogram_ram_rom_slot_chip_fn_t)(
+    uint8_t slot,
+    uint8_t chip,
+    uint32_t offset,
+    const uint8_t *buf,
+    uint32_t len,
+    uint8_t allow_active
+);
+
+/**
+ * @brief Read one chip of a RAM ROM slot
+ * @sa ORA_ID_LOCAL_READ_RAM_ROM_SLOT_CHIP
+ * @since firmware 0.8.0, local extension
+ *
+ * As @ref ora_read_ram_rom_slot_fn_t, for chip @p chip, numbered as for
+ * @ref ora_reprogram_ram_rom_slot_chip_fn_t.  The read must end within the
+ * chip's size.
+ *
+ * @param slot    RAM ROM slot to read
+ * @param chip    Chip within the slot
+ * @param offset  Logical start address within the chip
+ * @param buf     Buffer to receive the logical data bytes
+ * @param len     Number of bytes to read
+ * @return ORA_RESULT_OK on success.
+ *         ORA_RESULT_INVALID_ARG if @p buf is NULL, @p len is zero, @p chip
+ *         isn't in the slot, or the read doesn't end within the chip and the
+ *         RAM slot.
+ *         ORA_RESULT_INVALID_SLOT if @p slot is out of range.
+ */
+typedef ora_result_t (*ora_read_ram_rom_slot_chip_fn_t)(
+    uint8_t slot,
+    uint8_t chip,
+    uint32_t offset,
+    uint8_t *buf,
+    uint32_t len
+);
+
+/**
+ * @brief Demangle a physical address to a chip and its logical address
+ * @sa ORA_ID_LOCAL_DEMANGLE_ADDR_CHIP
+ * @since firmware 0.8.0, local extension
+ *
+ * As @ref ora_demangle_addr_fn_t with its control pin check, but in a
+ * multi-ROM slot it also accepts a read of the chips on X1 and X2, and says
+ * which chip was read.  The address is within that chip, so the address lines
+ * a smaller chip doesn't have read as 0.  Outside a multi-ROM slot the chip is
+ * always 0.
+ *
+ * @param physical_addr     Physical address, as for @ref ora_demangle_addr_fn_t
+ * @param logical_addr_out  Receives the logical address within the chip
+ * @param chip_out          Receives the chip read
+ * @return ORA_RESULT_OK on success.
+ *         ORA_RESULT_CONTROL_PIN_ACTIVE if the capture selected no chip, or
+ *         more than one.
+ *         ORA_RESULT_INVALID_ARG if either output pointer is NULL.
+ */
+typedef ora_result_t (*ora_demangle_addr_chip_fn_t)(
+    uint32_t physical_addr,
+    uint32_t *logical_addr_out,
+    uint8_t *chip_out
+);
+
+/**
+ * @brief Set up the address monitor to capture a read of any chip
+ * @sa ORA_ID_LOCAL_SETUP_ADDRESS_MONITOR_ALL_CHIPS
+ * @since firmware 0.8.0, local extension
+ *
+ * As @ref ora_setup_address_monitor_fn_t, taking the same arguments, except
+ * that in a multi-ROM slot it captures a read of any of the slot's chips - a
+ * read One ROM answers - rather than of chip 0 alone.  Pass the captures to
+ * @ref ora_demangle_addr_chip_fn_t to learn which chip each read.  Outside a
+ * multi-ROM slot the two calls are the same.
+ */
+typedef ora_setup_address_monitor_fn_t ora_setup_address_monitor_all_chips_fn_t;
 
 /** @} */ // plugin_api_functions
 

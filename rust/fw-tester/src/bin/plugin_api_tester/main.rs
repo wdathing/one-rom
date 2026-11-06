@@ -25,9 +25,11 @@
 //! Every `Single` flash slot in the config is exercised in turn.  The firmware
 //! is rebooted with `sel_image` set to the slot's [`flash_slot`] number,
 //! making it the active boot image, and the full test suite is run against it.
-//! Multi/Banked slots boot the same way but run only the GPIO classification
-//! test — their serving is covered by the separate pio-tester, while their
-//! GPIO layout is not reachable from a Single slot.  Plugin slots are skipped.
+//! Banked slots boot the same way but run only the GPIO classification test —
+//! their serving is covered by the separate pio-tester, while their GPIO layout
+//! is not reachable from a Single slot.  Multi slots run that test and the
+//! tests of the calls that reach their chips beyond chip 0.  Plugin slots are
+//! skipped.
 //!
 //! A slot that boots into standby is checked for undriven data pins, then
 //! standby is turned off ahead of the serving tests.  A slot without an image
@@ -124,18 +126,28 @@ fn main() {
                     idx,
                 );
             }
-            // Multi and Banked slots are not exercised for serving here — the
-            // pio-tester covers that — but their GPIO layout is what makes
-            // them interesting to the GPIO classification: X pins are folded
-            // into the address span and the chip-select range sits inside it.
-            // So they boot and run that one test.
-            ChipSetType::Multi | ChipSetType::Banked => {
-                let kind = if chip_set.set_type == ChipSetType::Multi {
-                    "Multi"
-                } else {
-                    "Banked"
-                };
-                let label = format!("{label} ({kind}, GPIO classification only)");
+            // A Multi slot runs the GPIO classification and the tests of the
+            // calls that reach its chips beyond chip 0 - see run_slot_multi.
+            ChipSetType::Multi => {
+                let label = format!("{label} (Multi)");
+                report.begin_slot(idx, sel, &label);
+                run_slot_multi(
+                    &mut report,
+                    board,
+                    &jumpers,
+                    &config,
+                    &base_dir,
+                    log_enabled,
+                    idx,
+                );
+            }
+            // Banked slots are not exercised for serving here — the pio-tester
+            // covers that — but their GPIO layout is what makes them
+            // interesting to the GPIO classification: X pins are folded into
+            // the address span and the chip-select range sits inside it.  So
+            // they boot and run that one test.
+            ChipSetType::Banked => {
+                let label = format!("{label} (Banked, GPIO classification only)");
                 report.begin_slot(idx, sel, &label);
                 run_slot_gpio_only(
                     &mut report,
@@ -195,14 +207,78 @@ fn add_gpio_set_x_pin(report: &mut ApiReport, emulator: &Emulator, board: Board)
     }
 }
 
+/// Boot the firmware with Multi chip set `set_idx` selected and run the GPIO
+/// classification, then the tests of the calls that reach the slot's chips
+/// beyond chip 0 (`tests::multi`).
+///
+/// The serving of the slot as booted is the pio-tester's; here it is the
+/// baseline the calls' own effects on serving are measured against.
+fn run_slot_multi(
+    report: &mut ApiReport,
+    board: Board,
+    jumpers: &Jumpers,
+    config: &Config,
+    base_dir: &std::path::Path,
+    log_enabled: bool,
+    set_idx: usize,
+) {
+    let sel = flash_slot(config, set_idx) as u8;
+    let (mut emulator, fw_version) = setup(board, jumpers, log_enabled, sel);
+
+    report.add(
+        "gpio_use",
+        tests::gpio::test_gpio_use(&emulator, config, board, fw_version, base_dir, set_idx),
+    );
+    add_gpio_set_x_pin(report, &emulator, board);
+
+    let rig = match tests::multi::MultiRig::build(config, board, fw_version, base_dir, set_idx) {
+        Ok(rig) => rig,
+        Err(e) => {
+            report.add("multi_rig", Err(e));
+            return;
+        }
+    };
+
+    emulator.setup_epio(8);
+    emulator.step_cycles(timing::CYCLES_BEFORE_START);
+
+    report.add(
+        "multi_initial_serving",
+        tests::multi::test_initial_serving(&emulator, &rig),
+    );
+    report.add(
+        "multi_read_chip",
+        tests::multi::test_read_chip(&emulator, &rig, BOOT_SLOT),
+    );
+    report.add(
+        "multi_refusals",
+        tests::multi::test_refusals(&emulator, &rig, BOOT_SLOT),
+    );
+    report.add(
+        "multi_reprogram_chip_serves",
+        tests::multi::test_reprogram_chip_serves(&emulator, &rig, BOOT_SLOT),
+    );
+    if rig.chip_count() > 1 {
+        report.add(
+            "multi_x_pin_disable",
+            tests::multi::test_x_pin_disable(&emulator, &rig, board),
+        );
+    }
+    // Starts the address monitor, so last.
+    report.add(
+        "multi_demangle_chip",
+        tests::multi::test_demangle_chip(&emulator, &rig),
+    );
+}
+
 /// Boot the firmware with chip set `set_idx` selected and run only the GPIO
 /// classification test against it.
 ///
-/// Used for Multi and Banked slots, whose serving is covered by the pio-tester
-/// but whose GPIO layout — X pins folded into the address span, the
-/// chip-select range inside it — is not reachable from a Single slot.  No epio
-/// setup is needed: the classification is derived from the slot configuration
-/// and the GPIO setup boot performed, both complete before any cycle runs.
+/// Used for Banked slots, whose serving is covered by the pio-tester but whose
+/// GPIO layout — X pins folded into the address span, the chip-select range
+/// inside it — is not reachable from a Single slot.  No epio setup is needed:
+/// the classification is derived from the slot configuration and the GPIO
+/// setup boot performed, both complete before any cycle runs.
 fn run_slot_gpio_only(
     report: &mut ApiReport,
     board: Board,
@@ -469,6 +545,10 @@ fn run_slot(
     } else {
         report.skip("read_initial_slot", "the set doesn't have an image to load");
     }
+    report.add(
+        "single_slot_chip_calls",
+        tests::multi::test_single_slot(&emulator, BOOT_SLOT, &boot_image),
+    );
 
     // Set up epio before any reprogram so that the PIO path can be verified
     // against the unmodified oracle image in the boot slot.  epio_from_apio()

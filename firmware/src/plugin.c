@@ -447,6 +447,16 @@ ora_result_t ora_setup_address_monitor(
     return pio_setup_address_monitor(ring_buf, ring_entries_log2, mode, data_size, options);
 }
 
+ora_result_t ora_setup_address_monitor_all_chips(
+    volatile uint32_t *ring_buf,
+    uint8_t ring_entries_log2,
+    ora_monitor_mode_t mode,
+    uint8_t data_size,
+    const ora_address_monitor_options_t *options
+) {
+    return pio_setup_address_monitor_all_chips(ring_buf, ring_entries_log2, mode, data_size, options);
+}
+
 ora_result_t ora_led_set(const ora_led_request_t *req) {
     return pio_led_set(req);
 }
@@ -523,6 +533,29 @@ ora_result_t ora_reprogram_ram_rom_slot(
     uint8_t allow_active
 ) {
     return pio_reprogram_ram_rom_slot(slot, offset, data, len, allow_active);
+}
+
+ora_result_t ora_reprogram_ram_rom_slot_chip(
+    uint8_t slot,
+    uint8_t chip,
+    uint32_t offset,
+    const uint8_t *data,
+    uint32_t len,
+    uint8_t allow_active
+) {
+    return pio_reprogram_ram_rom_slot_chip(slot, chip, offset, data, len, allow_active);
+}
+
+ora_result_t ora_demangle_addr_chip(
+    uint32_t physical_addr,
+    uint32_t *logical_addr_out,
+    uint8_t *chip_out
+) {
+    return pio_demangle_addr_chip(CURRENT_SLOT, physical_addr, logical_addr_out, chip_out);
+}
+
+ora_result_t ora_set_x_pin_enabled(uint8_t x_pin, uint8_t enabled) {
+    return pio_set_x_pin_enabled(CURRENT_SLOT, x_pin, enabled);
 }
 
 ora_result_t ora_start_address_monitor(void) {
@@ -1095,6 +1128,16 @@ ora_result_t ora_read_ram_rom_slot(
     uint32_t  len
 ) {
     return pio_read_ram_rom_slot(CURRENT_SLOT, slot, offset, buf, len);
+}
+
+ora_result_t ora_read_ram_rom_slot_chip(
+    uint8_t   slot,
+    uint8_t   chip,
+    uint32_t  offset,
+    uint8_t  *buf,
+    uint32_t  len
+) {
+    return pio_read_ram_rom_slot_chip(CURRENT_SLOT, slot, chip, offset, buf, len);
 }
 
 static uint8_t ora_gpio_use_is_busy(uint8_t use) {
@@ -1888,6 +1931,18 @@ void *ora_fn_lookup(api_id_t id) {
             return ora_firmware_state_query;
         case ORA_ID_SET_STANDBY:
             return ora_set_standby;
+
+        // Local extensions - see their block in api.h's api_id_t.
+        case ORA_ID_LOCAL_SET_X_PIN_ENABLED:
+            return ora_set_x_pin_enabled;
+        case ORA_ID_LOCAL_REPROGRAM_RAM_ROM_SLOT_CHIP:
+            return ora_reprogram_ram_rom_slot_chip;
+        case ORA_ID_LOCAL_READ_RAM_ROM_SLOT_CHIP:
+            return ora_read_ram_rom_slot_chip;
+        case ORA_ID_LOCAL_DEMANGLE_ADDR_CHIP:
+            return ora_demangle_addr_chip;
+        case ORA_ID_LOCAL_SETUP_ADDRESS_MONITOR_ALL_CHIPS:
+            return ora_setup_address_monitor_all_chips;
 
         // Deprecated functions
         case ORA_ID_GET_FIRMWARE_INFO:

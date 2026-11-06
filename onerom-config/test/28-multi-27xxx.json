@@ -36,6 +36,21 @@
                     "size_handling": "truncate"
                 }
             ]
+        },
+        {
+            "type": "multi",
+            "description": "set 2 - a smaller chip on X1",
+            "roms": [
+                {
+                    "file": "images/test/rand_16KB.rom",
+                    "type": "27128"
+                },
+                {
+                    "file": "images/test/rand_8KB.rom",
+                    "type": "2764",
+                    "oe": "ignore"
+                }
+            ]
         }
     ]
 }
