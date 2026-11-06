@@ -51,6 +51,27 @@
                     "oe": "ignore"
                 }
             ]
+        },
+        {
+            "type": "single",
+            "description": "set 3 - a 27128 to load into a multi-ROM slot",
+            "roms": [
+                {
+                    "file": "images/test/rand_32KB.rom",
+                    "type": "27128",
+                    "size_handling": "truncate"
+                }
+            ]
+        },
+        {
+            "type": "single",
+            "description": "set 4 - a 2764 to load into a multi-ROM slot",
+            "roms": [
+                {
+                    "file": "images/test/0_63_8192.rom",
+                    "type": "2764"
+                }
+            ]
         }
     ]
 }

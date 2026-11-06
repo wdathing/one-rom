@@ -826,6 +826,22 @@ ora_result_t ora_copy_flash_slot_to_ram_slot(
     return ORA_RESULT_OK;
 }
 
+ora_result_t ora_copy_flash_chip_to_ram_chip(
+    uint8_t flash_slot,
+    uint32_t flags,
+    uint8_t src_chip,
+    uint8_t ram_slot,
+    uint8_t dst_chip,
+    uint8_t allow_active
+) {
+    // A plugin slot holds no ROM to read through a layout.
+    const onerom_rom_slot_t *set = get_flash_slot_slot(flash_slot, flags);
+    if ((set == NULL) || !rom_slot_in_flash(set) || is_plugin_type(set)) {
+        return ORA_RESULT_INVALID_SLOT;
+    }
+    return pio_copy_flash_chip_to_ram_chip(set, src_chip, ram_slot, dst_chip, allow_active);
+}
+
 ora_result_t ora_get_device_version(uint8_t *version_out, uint32_t max_len) {
     if (max_len < version_str_len) {
         return ORA_RESULT_INVALID_SIZE;
@@ -1943,6 +1959,8 @@ void *ora_fn_lookup(api_id_t id) {
             return ora_demangle_addr_chip;
         case ORA_ID_LOCAL_SETUP_ADDRESS_MONITOR_ALL_CHIPS:
             return ora_setup_address_monitor_all_chips;
+        case ORA_ID_LOCAL_COPY_FLASH_CHIP_TO_RAM_CHIP:
+            return ora_copy_flash_chip_to_ram_chip;
 
         // Deprecated functions
         case ORA_ID_GET_FIRMWARE_INFO:

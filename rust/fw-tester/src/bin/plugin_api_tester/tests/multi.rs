@@ -26,14 +26,14 @@ use std::path::Path;
 use onerom_config::chip::ChipType;
 use onerom_config::fw::FirmwareVersion;
 use onerom_config::hw::Board;
-use onerom_fw_emulator::{Emulator, OraResult, ffi};
+use onerom_fw_emulator::{Emulator, ORA_FLASH_SLOT_FLAG_EXCLUDE_PLUGINS, OraResult, ffi};
 use onerom_fw_tester::driver;
 use onerom_fw_tester::geometry;
 use onerom_fw_tester::oracle;
 use onerom_fw_tester::pin_cache::{ControlLine, PinCache, per_chip_select};
 use onerom_fw_tester::runner::{addr_before_cs_cycles, run_mode};
 use onerom_fw_tester::timing;
-use onerom_gen::Config;
+use onerom_gen::{ChipSetType, Config};
 
 /// Where the demangle test's address monitor ring sits: above the RAM slots,
 /// as the address-monitor tester places it.
@@ -659,6 +659,133 @@ pub fn test_demangle_chip(emu: &Emulator, rig: &MultiRig) -> Result<(), String> 
 
     if errors.is_empty() {
         println!("  {} chips' captures demangled", rig.chips.len());
+    }
+    verdict(errors)
+}
+
+/// The single-chip sets in `config` a chip of the rig could be loaded from:
+/// for each chip, the first such set whose chip is the same size, with its
+/// image.  Empty where the config has none.
+pub fn copy_sources(
+    config: &Config,
+    base_dir: &Path,
+    rig: &MultiRig,
+) -> Vec<(usize, usize, Vec<u8>)> {
+    let mut sources = Vec::new();
+    for (k, chip) in rig.chips.iter().enumerate() {
+        let found = config
+            .chip_sets
+            .iter()
+            .enumerate()
+            .find_map(|(set_idx, set)| {
+                let source = set.chips.first()?;
+                let chip_type = source.chip_type.resolved();
+                (set.set_type == ChipSetType::Single
+                    && set_idx >= crate::plugin_sets(config)
+                    && chip_type.size_bytes() == chip.chip_type.size_bytes())
+                .then(|| (set_idx, oracle::load(source, chip_type, base_dir)))
+            });
+        if let Some((set_idx, image)) = found {
+            sources.push((k, set_idx, image));
+        }
+    }
+    sources
+}
+
+/// Each chip of the served slot loaded from a single-chip flash slot of its
+/// size serves that slot's ROM; loading the boot slot's own chips back serves
+/// the slot as booted.  So a ROM stored compactly becomes a chip of a
+/// multi-ROM slot, and a multi-ROM slot's chips copy between slots of one
+/// shape.  Then every refusal.
+pub fn test_copy_flash_chip(
+    emu: &Emulator,
+    rig: &MultiRig,
+    config: &Config,
+    sources: &[(usize, usize, Vec<u8>)],
+    slot: u8,
+) -> Result<(), String> {
+    const FLAGS: u32 = ORA_FLASH_SLOT_FLAG_EXCLUDE_PLUGINS;
+    let mut errors = Vec::new();
+    let booted = crate::flash_slot(config, rig.set_idx) as u8;
+
+    for (k, set_idx, image) in sources {
+        let flash_slot = crate::flash_slot(config, *set_idx) as u8;
+        note(
+            &mut errors,
+            &format!("copy flash slot {flash_slot} into chip {k}"),
+            emu.copy_flash_chip_to_ram_chip(flash_slot, FLAGS, 0, slot, *k as u8, true),
+            OraResult::Ok,
+        );
+        if let Err(e) = verify_serving(emu, rig, *k, image) {
+            errors.push(format!("loaded from flash slot {flash_slot}: {e}"));
+        }
+    }
+
+    for (k, chip) in rig.chips.iter().enumerate() {
+        note(
+            &mut errors,
+            &format!("copy the boot slot's chip {k} back"),
+            emu.copy_flash_chip_to_ram_chip(booted, FLAGS, k as u8, slot, k as u8, true),
+            OraResult::Ok,
+        );
+        if let Err(e) = verify_serving(emu, rig, k, &chip.image) {
+            errors.push(format!("copied back: {e}"));
+        }
+    }
+
+    let n = rig.chips.len() as u8;
+    let flash_count = emu.get_flash_slot_count(FLAGS);
+    for (what, got, want) in [
+        (
+            format!("flash slot {flash_count}, past the last"),
+            emu.copy_flash_chip_to_ram_chip(flash_count, FLAGS, 0, slot, 0, true),
+            OraResult::InvalidSlot,
+        ),
+        (
+            format!("source chip {n}, past the boot slot's last"),
+            emu.copy_flash_chip_to_ram_chip(booted, FLAGS, n, slot, 0, true),
+            OraResult::InvalidArg,
+        ),
+        (
+            format!("destination chip {n}, past the last"),
+            emu.copy_flash_chip_to_ram_chip(booted, FLAGS, 0, slot, n, true),
+            OraResult::InvalidArg,
+        ),
+        (
+            "into the active slot without allow_active".to_string(),
+            emu.copy_flash_chip_to_ram_chip(booted, FLAGS, 0, slot, 0, false),
+            OraResult::SlotActive,
+        ),
+    ] {
+        note(&mut errors, &what, got, want);
+    }
+
+    // A chip of another size, where the config has one.
+    let mismatched = sources.iter().find_map(|(_, set_idx, _)| {
+        let size = config.chip_sets[*set_idx].chips[0]
+            .chip_type
+            .resolved()
+            .size_bytes();
+        rig.chips
+            .iter()
+            .position(|chip| chip.chip_type.size_bytes() != size)
+            .map(|k| (crate::flash_slot(config, *set_idx) as u8, k as u8))
+    });
+    if let Some((flash_slot, k)) = mismatched {
+        note(
+            &mut errors,
+            &format!("flash slot {flash_slot} into chip {k}, another size"),
+            emu.copy_flash_chip_to_ram_chip(flash_slot, FLAGS, 0, slot, k, true),
+            OraResult::InvalidSize,
+        );
+    }
+
+    if errors.is_empty() {
+        println!(
+            "  {} chip(s) loaded from single-chip slots, {} copied back",
+            sources.len(),
+            rig.chips.len()
+        );
     }
     verdict(errors)
 }

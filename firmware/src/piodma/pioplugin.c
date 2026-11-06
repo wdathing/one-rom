@@ -1992,6 +1992,57 @@ static ora_result_t pio_reprogram_chip(
     return ORA_RESULT_OK;
 }
 
+// Copies chip src_chip of flash slot src into chip dst_chip of RAM slot
+// ram_slot, which belongs to the slot being served.  The source is read through
+// its own slot's layout and the destination written through the served slot's,
+// so the two needn't share a shape: a single-chip slot's ROM can become one
+// chip of a multi-ROM slot.  The chips must be the same size.  Bytes are
+// written in ascending address order, so the last ones land last.
+ora_result_t pio_copy_flash_chip_to_ram_chip(
+    const onerom_rom_slot_t *src,
+    uint8_t src_chip,
+    uint8_t ram_slot,
+    uint8_t dst_chip,
+    uint8_t allow_active
+) {
+    if (src_chip >= src->rom_count || dst_chip >= CURRENT_SLOT->rom_count) {
+        return ORA_RESULT_INVALID_ARG;
+    }
+    uint32_t size = src->roms[src_chip]->chip_size;
+    if (size != CURRENT_SLOT->roms[dst_chip]->chip_size) {
+        return ORA_RESULT_INVALID_SIZE;
+    }
+
+    chip_table_masks_t masks;
+    ora_result_t result = pio_chip_table_masks(src, src_chip, &masks);
+    if (result != ORA_RESULT_OK) {
+        return result;
+    }
+
+    // In chunks, so the caller's stack - a plugin's, as small as 1KB - holds
+    // only this much of the ROM at once.
+    uint8_t buf[32];
+    for (uint32_t offset = 0u; offset < size; offset += sizeof(buf)) {
+        uint32_t len = size - offset;
+        if (len > sizeof(buf)) {
+            len = sizeof(buf);
+        }
+        for (uint32_t i = 0u; i < len; i++) {
+            uint32_t index = pio_chip_table_index(src, &masks, offset + i);
+            if (index >= src->size) {
+                return ORA_RESULT_INTERNAL_ERROR;
+            }
+            buf[i] = pio_demangle_data(src, src->data[index]);
+        }
+        result = pio_reprogram_chip(ram_slot, dst_chip, offset, buf, len, allow_active, size);
+        if (result != ORA_RESULT_OK) {
+            return result;
+        }
+    }
+
+    return ORA_RESULT_OK;
+}
+
 // pio_reprogram_chip() on chip 0, bounded by the RAM slot alone.
 ora_result_t pio_reprogram_ram_rom_slot(
     uint8_t slot,

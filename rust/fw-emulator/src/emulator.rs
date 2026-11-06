@@ -1135,6 +1135,29 @@ impl Emulator {
         ))
     }
 
+    /// `ORA_ID_LOCAL_COPY_FLASH_CHIP_TO_RAM_CHIP`.  This fork's local
+    /// extension.
+    pub fn copy_flash_chip_to_ram_chip(
+        &self,
+        flash_slot: u8,
+        flags: u32,
+        src_chip: u8,
+        ram_slot: u8,
+        dst_chip: u8,
+        allow_active: bool,
+    ) -> OraResult {
+        OraResult::from(plugin_call!(
+            ffi::api_id_t_ORA_ID_LOCAL_COPY_FLASH_CHIP_TO_RAM_CHIP,
+            ffi::ora_copy_flash_chip_to_ram_chip_fn_t,
+            flash_slot,
+            flags,
+            src_chip,
+            ram_slot,
+            dst_chip,
+            allow_active as u8
+        ))
+    }
+
     /// `ORA_ID_LOCAL_DEMANGLE_ADDR_CHIP`, giving the chip read and the
     /// address within it.  This fork's local extension.
     pub fn demangle_addr_chip(&self, physical_addr: u32) -> (OraResult, u32, u8) {

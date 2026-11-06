@@ -258,6 +258,20 @@ fn run_slot_multi(
         "multi_reprogram_chip_serves",
         tests::multi::test_reprogram_chip_serves(&emulator, &rig, BOOT_SLOT),
     );
+    // Restores the slot's own chips when it's done, so the tests after it see
+    // the slot as booted.
+    let sources = tests::multi::copy_sources(config, base_dir, &rig);
+    if sources.is_empty() {
+        report.skip(
+            "multi_copy_flash_chip",
+            "the config has no single-chip slot of a chip's size to load",
+        );
+    } else {
+        report.add(
+            "multi_copy_flash_chip",
+            tests::multi::test_copy_flash_chip(&emulator, &rig, config, &sources, BOOT_SLOT),
+        );
+    }
     if rig.chip_count() > 1 {
         report.add(
             "multi_x_pin_disable",

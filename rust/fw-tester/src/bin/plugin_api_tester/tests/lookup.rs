@@ -240,6 +240,10 @@ pub fn test_lookup_coverage(emu: &Emulator, base_dir: &Path) -> Result<(), Strin
             ffi::api_id_t_ORA_ID_LOCAL_SETUP_ADDRESS_MONITOR_ALL_CHIPS,
             "ORA_ID_LOCAL_SETUP_ADDRESS_MONITOR_ALL_CHIPS",
         ),
+        (
+            ffi::api_id_t_ORA_ID_LOCAL_COPY_FLASH_CHIP_TO_RAM_CHIP,
+            "ORA_ID_LOCAL_COPY_FLASH_CHIP_TO_RAM_CHIP",
+        ),
     ];
 
     // Deprecated/invalid IDs — must resolve to null.

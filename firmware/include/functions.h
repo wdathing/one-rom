@@ -224,6 +224,13 @@ ora_result_t pio_demangle_addr_chip(
     uint32_t *logical_addr_out,
     uint8_t *chip_out
 );
+ora_result_t pio_copy_flash_chip_to_ram_chip(
+    const onerom_rom_slot_t *src,
+    uint8_t src_chip,
+    uint8_t ram_slot,
+    uint8_t dst_chip,
+    uint8_t allow_active
+);
 ora_result_t pio_set_x_pin_enabled(
     const onerom_rom_slot_t *slot,
     uint8_t x_pin,

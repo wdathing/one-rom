@@ -842,6 +842,13 @@ typedef enum {
      */
     ORA_ID_LOCAL_SETUP_ADDRESS_MONITOR_ALL_CHIPS = 0x00010004,
 
+    /**
+     * @brief Copy one chip of a flash slot into one chip of a RAM slot
+     * @sa ora_copy_flash_chip_to_ram_chip_fn_t
+     * @since firmware 0.8.0, local extension
+     */
+    ORA_ID_LOCAL_COPY_FLASH_CHIP_TO_RAM_CHIP = 0x00010005,
+
     /** Invalid API identifier */
     ORA_ID_INVALID = 0xFFFFFFFF,
 } api_id_t;
@@ -3568,6 +3575,45 @@ typedef ora_result_t (*ora_demangle_addr_chip_fn_t)(
  * multi-ROM slot the two calls are the same.
  */
 typedef ora_setup_address_monitor_fn_t ora_setup_address_monitor_all_chips_fn_t;
+
+/**
+ * @brief Copy one chip of a flash slot into one chip of a RAM slot
+ * @sa ORA_ID_LOCAL_COPY_FLASH_CHIP_TO_RAM_CHIP
+ * @since firmware 0.8.0, local extension
+ *
+ * Copies chip @p src_chip of a flash slot into chip @p dst_chip, numbered as
+ * for @ref ora_reprogram_ram_rom_slot_chip_fn_t, of a RAM slot of the slot
+ * being served.  Unlike @ref ora_copy_flash_slot_to_ram_slot_fn_t the two slots
+ * needn't have the same shape - a ROM stored as a small single-chip slot can
+ * be loaded as one chip of a multi-ROM slot - but the two chips must be the
+ * same size.  Each byte lands everywhere a read of it can reach, as with
+ * @ref ora_reprogram_ram_rom_slot_chip_fn_t, and bytes are written in
+ * ascending address order, so the chip's last bytes are written last.
+ *
+ * @param flash_slot    Flash slot to copy from, relative to the filtered set
+ *                      @p flags specifies, as for
+ *                      @ref ora_copy_flash_slot_to_ram_slot_fn_t
+ * @param flags         Filtering flags
+ * @param src_chip      Chip within the flash slot
+ * @param ram_slot      RAM ROM slot to copy into
+ * @param dst_chip      Chip within the RAM slot
+ * @param allow_active  If non-zero, allow writing to the RAM slot being served
+ * @return ORA_RESULT_OK on success.
+ *         ORA_RESULT_INVALID_SLOT if @p flash_slot is out of range, isn't in
+ *         flash, or holds a plugin, or @p ram_slot is out of range.
+ *         ORA_RESULT_INVALID_ARG if either chip isn't in its slot.
+ *         ORA_RESULT_INVALID_SIZE if the two chips differ in size.
+ *         ORA_RESULT_SLOT_ACTIVE if @p ram_slot is being served and
+ *         @p allow_active is zero.
+ */
+typedef ora_result_t (*ora_copy_flash_chip_to_ram_chip_fn_t)(
+    uint8_t flash_slot,
+    uint32_t flags,
+    uint8_t src_chip,
+    uint8_t ram_slot,
+    uint8_t dst_chip,
+    uint8_t allow_active
+);
 
 /** @} */ // plugin_api_functions
 
