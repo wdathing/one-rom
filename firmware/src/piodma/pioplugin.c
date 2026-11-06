@@ -145,6 +145,14 @@ static v2_x_pin_gpios_t v2_get_x_pin_gpios(
  
         // Skip CS range (real CS lines and any cs_ignore_index gap).
         if (g >= cs_base && g < cs_end) continue;
+
+        // Skip a GPIO held at one level - a pin unused by this chip type, VPP
+        // on a 27128, say.  It is in the window by design, and reporting it
+        // here put an error log, formatted on the caller's stack, behind
+        // every checked demangle of a Multi slot - from a plugin, onto its
+        // 1KB stack.
+        uint8_t override = v2_get_gpio_override(slot, g);
+        if (override == GPIO_OVER_LOW || override == GPIO_OVER_HIGH) continue;
  
         // Match against hardware X pin arrays.
         uint8_t matched = 0;
@@ -1916,6 +1924,72 @@ ora_result_t pio_wait_for_knock(
     return ORA_RESULT_OK;
 }
 
+// Where writes to chip `chip` of RAM slot `slot` go: the slot's SRAM, as the
+// firmware addresses it and as this build reaches it, and the chip's table
+// masks.  Refuses the slot being served unless allow_active.
+typedef struct {
+    uint32_t addr;
+    uint8_t *sram;
+    chip_table_masks_t masks;
+} chip_writer_t;
+
+static ora_result_t pio_chip_writer(
+    uint8_t slot,
+    uint8_t chip,
+    uint8_t allow_active,
+    uint32_t *size_out,
+    chip_writer_t *out
+) {
+    ora_result_t result = ora_get_ram_slot_info(slot, &out->addr, size_out, NULL);
+    if (result != ORA_RESULT_OK) {
+        return result;
+    }
+
+    result = pio_chip_table_masks(CURRENT_SLOT, chip, &out->masks);
+    if (result != ORA_RESULT_OK) {
+        return result;
+    }
+
+    if (!allow_active) {
+        uint8_t active_slot;
+        result = ora_get_active_ram_slot(&active_slot);
+        if (result == ORA_RESULT_OK && active_slot == slot) {
+            return ORA_RESULT_SLOT_ACTIVE;
+        }
+    }
+
+#if REAL_HARDWARE
+    out->sram = (uint8_t *)(uintptr_t)out->addr;
+#else
+    out->sram = sram_to_host(out->addr);
+#endif
+    return ORA_RESULT_OK;
+}
+
+// Writes logical byte `byte` at logical address `logical` of the writer's
+// chip, to every combination of the free bits - see pio_chip_table_masks() -
+// so a live read lands on it whatever those GPIOs read.  The descent visits
+// every submask of masks.free, starting at the whole mask and ending after 0.
+// With no free bits it is one write.
+static void pio_chip_write(const chip_writer_t *w, uint32_t logical, uint8_t byte) {
+    uint32_t base_phys     = pio_chip_table_index(CURRENT_SLOT, &w->masks, logical);
+    uint8_t  physical_data = pio_map_data_to_phys(CURRENT_SLOT, byte);
+    uint32_t combo = w->masks.free;
+    for (;;) {
+        uint32_t physical_addr = base_phys | combo;
+        w->sram[physical_addr] = physical_data;
+#if !REAL_HARDWARE
+        // Under the device address, as ORA_SRAM_WRITE8 reports a plugin's own
+        // stores, so the two interleave in one record.
+        if (s_sram_write_hook != NULL) {
+            s_sram_write_hook(w->addr + physical_addr, physical_data);
+        }
+#endif
+        if (combo == 0) break;
+        combo = (combo - 1) & w->masks.free;
+    }
+}
+
 // Writes a contiguous logical region of chip `chip` in RAM slot `slot`, which
 // must end within `limit` bytes as well as within the RAM slot.
 static ora_result_t pio_reprogram_chip(
@@ -1931,62 +2005,24 @@ static ora_result_t pio_reprogram_chip(
         return ORA_RESULT_INVALID_ARG;
     }
 
-    // Get the SRAM address and size of the target slot
-    uint32_t addr, size;
-    ora_result_t result = ora_get_ram_slot_info(slot, &addr, &size, NULL);
-    if (result != ORA_RESULT_OK) {
+    chip_writer_t w;
+    uint32_t size;
+    ora_result_t result = pio_chip_writer(slot, chip, allow_active, &size, &w);
+    if (result != ORA_RESULT_OK && result != ORA_RESULT_SLOT_ACTIVE) {
         return result;
     }
 
-    // Check the write stays within the slot and the chip
+    // Check the write stays within the slot and the chip, ahead of refusing
+    // the active slot, as before the writer was split out.
     if (offset + len > size || len > limit || offset > limit - len) {
         return ORA_RESULT_INVALID_ARG;
     }
-
-    chip_table_masks_t masks;
-    result = pio_chip_table_masks(CURRENT_SLOT, chip, &masks);
     if (result != ORA_RESULT_OK) {
         return result;
     }
 
-    // If allow_active is not set, refuse to write to the currently active slot
-    if (!allow_active) {
-        uint8_t active_slot;
-        result = ora_get_active_ram_slot(&active_slot);
-        if (result == ORA_RESULT_OK && active_slot == slot) {
-            return ORA_RESULT_SLOT_ACTIVE;
-        }
-    }
-
-    // Remap logical addresses and data bytes to their physical representations
-    // and write to the target slot in SRAM
-#if REAL_HARDWARE
-    uint8_t *sram = (uint8_t *)(uintptr_t)addr;
-#else
-    uint8_t *sram = sram_to_host(addr);
-#endif
-    // Each byte goes to every combination of the free bits - see
-    // pio_chip_table_masks() - so a live read lands on it whatever those
-    // GPIOs read.  The descent visits every submask of masks.free, starting
-    // at the whole mask and ending after 0.  With no free bits it is one
-    // write.
     for (uint32_t i = 0; i < len; i++) {
-        uint32_t base_phys    = pio_chip_table_index(CURRENT_SLOT, &masks, offset + i);
-        uint8_t  physical_data = pio_map_data_to_phys(CURRENT_SLOT, data[i]);
-        uint32_t combo = masks.free;
-        for (;;) {
-            uint32_t physical_addr = base_phys | combo;
-            sram[physical_addr] = physical_data;
-#if !REAL_HARDWARE
-            // Under the device address, as ORA_SRAM_WRITE8 reports a plugin's own
-            // stores, so the two interleave in one record.
-            if (s_sram_write_hook != NULL) {
-                s_sram_write_hook(addr + physical_addr, physical_data);
-            }
-#endif
-            if (combo == 0) break;
-            combo = (combo - 1) & masks.free;
-        }
+        pio_chip_write(&w, offset + i, data[i]);
     }
 
     return ORA_RESULT_OK;
@@ -1998,6 +2034,10 @@ static ora_result_t pio_reprogram_chip(
 // so the two needn't share a shape: a single-chip slot's ROM can become one
 // chip of a multi-ROM slot.  The chips must be the same size.  Bytes are
 // written in ascending address order, so the last ones land last.
+//
+// A byte at a time, straight from flash to the table, with both layouts
+// worked out once: a plugin calls this, and a plugin's stack is what core 0
+// has left above the plugin's static RAM, a few hundred bytes.
 ora_result_t pio_copy_flash_chip_to_ram_chip(
     const onerom_rom_slot_t *src,
     uint8_t src_chip,
@@ -2013,31 +2053,25 @@ ora_result_t pio_copy_flash_chip_to_ram_chip(
         return ORA_RESULT_INVALID_SIZE;
     }
 
-    chip_table_masks_t masks;
-    ora_result_t result = pio_chip_table_masks(src, src_chip, &masks);
+    chip_table_masks_t src_masks;
+    ora_result_t result = pio_chip_table_masks(src, src_chip, &src_masks);
     if (result != ORA_RESULT_OK) {
         return result;
     }
 
-    // In chunks, so the caller's stack - a plugin's, as small as 1KB - holds
-    // only this much of the ROM at once.
-    uint8_t buf[32];
-    for (uint32_t offset = 0u; offset < size; offset += sizeof(buf)) {
-        uint32_t len = size - offset;
-        if (len > sizeof(buf)) {
-            len = sizeof(buf);
+    chip_writer_t w;
+    uint32_t ram_size;
+    result = pio_chip_writer(ram_slot, dst_chip, allow_active, &ram_size, &w);
+    if (result != ORA_RESULT_OK) {
+        return result;
+    }
+
+    for (uint32_t offset = 0u; offset < size; offset++) {
+        uint32_t index = pio_chip_table_index(src, &src_masks, offset);
+        if (index >= src->size) {
+            return ORA_RESULT_INTERNAL_ERROR;
         }
-        for (uint32_t i = 0u; i < len; i++) {
-            uint32_t index = pio_chip_table_index(src, &masks, offset + i);
-            if (index >= src->size) {
-                return ORA_RESULT_INTERNAL_ERROR;
-            }
-            buf[i] = pio_demangle_data(src, src->data[index]);
-        }
-        result = pio_reprogram_chip(ram_slot, dst_chip, offset, buf, len, allow_active, size);
-        if (result != ORA_RESULT_OK) {
-            return result;
-        }
+        pio_chip_write(&w, offset, pio_demangle_data(src, src->data[index]));
     }
 
     return ORA_RESULT_OK;

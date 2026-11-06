@@ -123,6 +123,9 @@ static const uint8_t s_knock_read[KNOCK_LEN]  = {'!','D','W','R','E','C','V','!'
 // DriveWire proper - a One-ROM-specific extension the config app's own
 // knock-sending code (not fujinet-lib, not hdbdos) speaks directly.
 static const uint8_t s_knock_cart[KNOCK_LEN]  = {'!','L','D','C','A','R','T','!'};  // "!LDCART!"
+// CoCo -> plugin: load a boot menu entry - see drivewire_do_grub().  Only
+// matched in a multi-ROM slot, and the others only outside one.
+static const uint8_t s_knock_grub[KNOCK_LEN]  = {'!','G','R','U','B','G','O','!'};  // "!GRUBGO!"
 
 // ---------------------------------------------------------------------------
 // Protocol constants
@@ -320,6 +323,16 @@ typedef enum {
     SESSION_LOAD_CART,
 } session_dir_t;
 
+// Set at startup when One ROM is serving a multi-ROM slot - the motherboard
+// socket, with the cartridge select on X1 - which it can only do on firmware
+// carrying this fork's local extensions.  The plugin is then the coco-grub
+// boot menu's: it serves "!GRUBGO!" and nothing else, since DriveWire's
+// channel addresses are chip 0 offsets, and chip 0 is the menu, or BASIC.
+static bool s_grub_mode;
+static ora_copy_flash_chip_to_ram_chip_fn_t s_copy_flash_chip;
+static ora_lookup_fn_t s_lookup_fn;  // for drivewire_grub_main(), entered fresh
+static ora_set_x_pin_enabled_fn_t s_set_x_pin_enabled;
+
 // Dedicated RAM slot a pushed cartridge image is received into (see
 // drivewire_dbc_receive_cart()) and "!LDCART!" later activates (see
 // drivewire_do_load_cart()) - deliberately never the currently-active slot
@@ -505,6 +518,8 @@ enum {
     DW_ERR_UART_RX,            // arg: UART1's RSR - 8 overrun, 4 break, 2 parity, 1 framing
     DW_ERR_READ_SHORT,         // arg: reply bytes received - see DW_REPLY_GAP_MS
     DW_ERR_STALE_RX,           // arg: bytes discarded - see drivewire_discard_stale()
+    DW_ERR_GRUB,               // arg: (step << 8) | ora_result_t, step 1 chip 1, 2 X1, 3 chip 0; 0x100 alone, a bad check byte
+                               // - see drivewire_do_grub()
 };
 static volatile struct {
     uint8_t  code;
@@ -2184,6 +2199,138 @@ __attribute__((noinline)) static void drivewire_resolve_cart_window(ora_lookup_f
     }
 }
 
+// How the boot menu signals from the motherboard socket: byte b is a read of
+// $BC00+b, a page of grub.asm the menu's code never runs from or reads.  In
+// the socket every ROM cycle is captured - each dead cycle at $FFFF too,
+// which the SAM maps to the top of the socket - about one capture a
+// microsecond while the CoCo runs from ROM.  A firmware demangle of each one
+// falls behind that, and the 64-entry ring laps.  So each capture is tested
+// against the signal page's raw pattern first, a mask and a compare, and only
+// a signal is demangled.  Anything else is skipped outright: the knock is the
+// next eight signals, whatever comes between them.
+#define GRUB_SIGNAL_PAGE 0x3C00u   // chip 0 offset of $BC00
+
+typedef struct {
+    uint32_t mask;   // raw capture bits naming the page: A8-A13, and the selects
+    uint32_t match;  // those bits in a capture of the signal page
+} grub_filter_t;
+
+// The raw pattern of the signal page, from the firmware's own mapping, so it
+// holds whatever the board's pin routing.  A capture's address lines are where
+// pio_map_addr_to_phys() puts them, and its select bits are as that sets them
+// for chip 0.
+static void drivewire_grub_filter(ora_lookup_fn_t ora_lookup_fn, grub_filter_t *f) {
+    ora_map_addr_to_phys_fn_t map = ora_lookup_fn(ORA_ID_MAP_ADDR_TO_PHYS);
+    uint32_t base = map(0u);
+    uint32_t mask = base;
+    for (unsigned n = 8u; n < 14u; n++) {
+        mask |= map(1u << n) ^ base;
+    }
+    f->mask  = mask;
+    f->match = map(GRUB_SIGNAL_PAGE) & mask;
+}
+
+// The next byte the menu signals.  Waits as long as it takes.
+__attribute__((always_inline)) static inline uint8_t drivewire_grub_byte(const grub_filter_t *f) {
+    for (;;) {
+        if (RING_BUF_CUR_READ_INDEX() == RING_BUF_CUR_WRITE_INDEX()) {
+            ORA_TEST_YIELD();
+            continue;
+        }
+        uint32_t phys = (uint32_t)RING_BUF_GET_ENTRY(s_read_idx);
+        RING_BUF_ADV_READ_INDEX();
+        if ((phys & f->mask) != f->match) {
+            continue;
+        }
+        uint32_t addr;
+        if (s_demangle(phys, &addr, 1) == ORA_RESULT_OK) {
+            return (uint8_t)(addr & 0xFFu);
+        }
+    }
+}
+
+// Loads the coco-grub boot menu entry a "!GRUBGO!" knock names into the
+// served slot.  Four signalled bytes follow the knock - see
+// drivewire_grub_byte():
+//
+//   the flash slot (plugins excluded) of the ROM for chip 0, the socket;
+//   the flash slot of the ROM for chip 1, on the cartridge select, or 0xFF;
+//   flags - bit 0 answers the cartridge select;
+//   a check byte, the other three summed and XORed with 0x5A.
+//
+// The menu is running from the CoCo's own RAM by then, polling the reset
+// vector at $BFFE until it reads the entry's.  Chip 0 goes last, written in
+// ascending order, so the vector is the last thing to land: once the menu sees
+// it, the whole entry is in place.  Returns, for the caller to wait for the
+// next knock, only where the entry wasn't loaded; the menu times out and says
+// so.
+__attribute__((noinline)) static void drivewire_do_grub(const grub_filter_t *f) {
+    uint8_t b[4];
+    for (unsigned i = 0; i < 4u; i++) {
+        b[i] = drivewire_grub_byte(f);
+    }
+    if ((uint8_t)((b[0] + b[1] + b[2]) ^ 0x5Au) != b[3]) {
+        drivewire_error(DW_ERR_GRUB, 0x100u);
+        return;
+    }
+
+    ora_result_t rc;
+    bool chip1 = (b[1] != 0xFFu);
+    if (chip1) {
+        rc = s_copy_flash_chip(b[1], ORA_FLASH_SLOT_FLAG_EXCLUDE_PLUGINS, 0u,
+                               s_active_slot, 1u, 1u);
+        if (rc != ORA_RESULT_OK) {
+            drivewire_error(DW_ERR_GRUB, (uint16_t)(0x100u | rc));
+            return;
+        }
+    }
+    rc = s_set_x_pin_enabled(1u, (chip1 && (b[2] & 0x01u)) ? 1u : 0u);
+    if (rc != ORA_RESULT_OK) {
+        drivewire_error(DW_ERR_GRUB, (uint16_t)(0x200u | rc));
+        return;
+    }
+    rc = s_copy_flash_chip(b[0], ORA_FLASH_SLOT_FLAG_EXCLUDE_PLUGINS, 0u,
+                           s_active_slot, 0u, 1u);
+    if (rc != ORA_RESULT_OK) {
+        drivewire_error(DW_ERR_GRUB, (uint16_t)(0x300u | rc));
+        return;
+    }
+
+    // The entry now runs, and nothing in it speaks to this plugin yet, so stop
+    // watching the bus, as after "!LDCART!".  A power cycle brings the menu
+    // back.
+    for (;;) {
+        ORA_TEST_YIELD();
+    }
+}
+
+// The plugin's whole life in grub mode - see s_grub_mode: wait for the boot
+// menu's knock and load the entry it names.  Never returns, and entered with
+// the stack reset to its top - see drivewire_main().  A loop of its own rather
+// than a fourth knock in drivewire_wait_for_knock(): that is inlined into
+// drivewire_main() along with drivewire_next_addr(), and a second caller of
+// either grew its frame.  Grub mode has no use for DriveWire's UART draining
+// in any case.
+__attribute__((noinline, noreturn)) static void drivewire_grub_main(void) {
+    grub_filter_t f;
+    drivewire_grub_filter(s_lookup_fn, &f);
+    uint8_t window[KNOCK_LEN] = {0};
+    for (;;) {
+        for (unsigned i = 0; i < KNOCK_LEN - 1u; i++) {
+            window[i] = window[i + 1u];
+        }
+        window[KNOCK_LEN - 1u] = drivewire_grub_byte(&f);
+
+        bool match = true;
+        for (unsigned i = 0; i < KNOCK_LEN; i++) {
+            if (window[i] != s_knock_grub[i]) match = false;
+        }
+        if (match) {
+            drivewire_do_grub(&f);
+        }
+    }
+}
+
 static void drivewire_setup(ora_lookup_fn_t ora_lookup_fn) {
     s_demangle        = ora_lookup_fn(ORA_ID_DEMANGLE_ADDR);
     s_reprogram       = ora_lookup_fn(ORA_ID_REPROGRAM_RAM_ROM_SLOT);
@@ -2194,6 +2341,17 @@ static void drivewire_setup(ora_lookup_fn_t ora_lookup_fn) {
     s_get_sysclk_mhz  = ora_lookup_fn(ORA_ID_GET_SYSCLK_MHZ);
     s_set_status_led  = ora_lookup_fn(ORA_ID_SET_STATUS_LED);
     s_uptime_ms       = ora_lookup_fn(ORA_ID_GET_PLUGIN_UPTIME_MS);
+
+    // Firmware without this fork's local extensions looks both up as NULL.
+    // The X pin call is refused outside a multi-ROM slot, so it doubles as
+    // the test for one - and disabling X1 now leaves a real cartridge, if
+    // one is fitted, as the only thing answering $C000 while the menu runs,
+    // which is how the menu tells there is one.
+    s_lookup_fn         = ora_lookup_fn;
+    s_copy_flash_chip   = ora_lookup_fn(ORA_ID_LOCAL_COPY_FLASH_CHIP_TO_RAM_CHIP);
+    s_set_x_pin_enabled = ora_lookup_fn(ORA_ID_LOCAL_SET_X_PIN_ENABLED);
+    s_grub_mode = s_copy_flash_chip != NULL && s_set_x_pin_enabled != NULL &&
+                  s_set_x_pin_enabled(1u, 0u) == ORA_RESULT_OK;
 
     ora_setup_address_monitor_fn_t setup_monitor = ora_lookup_fn(ORA_ID_SETUP_ADDRESS_MONITOR);
     s_start_monitor = ora_lookup_fn(ORA_ID_START_ADDRESS_MONITOR);
@@ -2414,6 +2572,21 @@ void drivewire_main(
 
 
     drivewire_setup(ora_lookup_fn);
+    if (s_grub_mode) {
+        // The user plugin runs on core 0's own stack, entered from the
+        // firmware's launch code, and never returns - so in grub mode
+        // nothing below this frame, nor this frame itself, is used again.
+        // Restart the stack from its top, giving grub mode all of it: the
+        // firmware's entry copy goes ~190 bytes deep, and what is left once
+        // DriveWire's static RAM is taken is a few hundred.
+        __asm__ volatile (
+            "mov sp, %0\n"
+            "bx  %1\n"
+            :
+            : "r"(entry_args->stack_top), "r"(drivewire_grub_main)
+        );
+        __builtin_unreachable();
+    }
 
     for (;;) {
         drivewire_check_uart_rx();
