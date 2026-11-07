@@ -20,11 +20,12 @@ port directly.
 
 This plugin targets the **One ROM Fire 28 Rev C**, the only 28-pin variant
 with GPIO40/41 (RP2354B/QFN-80). Those two GPIOs are also this board's
-`SEL_C`/`SEL_D` image-select pads. **The `SEL_C`/`SEL_D` jumper must be left
-unpopulated** for the plugin to use them as UART1 - the firmware's own boot
-sequence stops driving pulls on them once image selection is read, but if
-the jumper itself is still soldered/populated it will electrically contend
-with the UART signal.
+`SEL_A` (GPIO40, TX) and `SEL_B` (GPIO41, RX) image-select pads, the two
+3.3V-only pads at the end of the header's top row - `onerom inspect header`
+draws it. **The `SEL_A`/`SEL_B` jumpers must be left unpopulated** for the
+plugin to use them as UART1 - the firmware's own boot sequence stops driving
+pulls on them once image selection is read, but if the jumper itself is
+still soldered/populated it will electrically contend with the UART signal.
 
 GPIO40/41 are 3.3V-only (not 5V-tolerant) ADC-capable pins. Whatever is
 wired to them - the DriveWire server bridge - must be 3.3V logic, never 5V

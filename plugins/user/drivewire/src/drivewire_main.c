@@ -7,7 +7,7 @@
 //
 // Bridges a DriveWire session between a CoCo/Dragon disk controller ROM and
 // a real DriveWire server, over One ROM's RP2350 UART1 hardware (GPIO40 TX,
-// GPIO41 RX - the One ROM Fire 28 Rev C SEL_C/SEL_D pads, which must be left
+// GPIO41 RX - the One ROM Fire 28 Rev C SEL_A/SEL_B pads, which must be left
 // unpopulated on this board for those pins to be free - see README) rather
 // than the CoCo's own bit-banger serial port.
 //
@@ -333,6 +333,23 @@ static ora_copy_flash_chip_to_ram_chip_fn_t s_copy_flash_chip;
 static ora_lookup_fn_t s_lookup_fn;  // for drivewire_grub_main(), entered fresh
 static ora_set_x_pin_enabled_fn_t s_set_x_pin_enabled;
 
+// The Becker port a coco-grub entry can ask for: SCS* ($FF40-$FF5F) on X2 and
+// the CPU's R/W on the socket's OE pin, pin 22, which the boot slot ignores.
+// One ROM answers $FF41 (status, bit 1 set while a byte waits) and $FF42 (the
+// byte) from its own table, and captures every access - see
+// drivewire_becker_main().  GPIOs are fire-28-c's, as UART1's are.
+#define BECKER_SCS_GPIO     8u
+#define BECKER_RW_GPIO      11u
+#define BECKER_STATUS_ADDR  0x3F41u   // chip 0 offset of $FF41
+#define BECKER_DATA_ADDR    0x3F42u   // chip 0 offset of $FF42
+#define BECKER_REG_MASK     0x1Fu     // SCS* decodes A0-A4
+#define BECKER_STATUS_READY 0x02u
+static ora_start_aux_port_fn_t s_start_aux;
+static ora_read_aux_port_fn_t  s_read_aux;
+static ora_write_aux_port_fn_t s_write_aux;
+static ora_get_aux_port_entries_fn_t s_aux_entries;
+static ora_gpio_query_fn_t     s_gpio_query;
+
 // Dedicated RAM slot a pushed cartridge image is received into (see
 // drivewire_dbc_receive_cart()) and "!LDCART!" later activates (see
 // drivewire_do_load_cart()) - deliberately never the currently-active slot
@@ -474,13 +491,16 @@ static uint8_t s_cart_push_chk;
 // session, 3=in a read session, 4=in a "!LDCART!" load, 5=a "!LDCART!" load
 // succeeded and this plugin has permanently stopped monitoring the ROM bus
 // (see drivewire_do_load_cart()'s own comment) - the terminal phase, since
-// nothing after it changes this again short of a power cycle.  session_count
-// increments once per detected knock (so once per session of any kind - a
-// full sector "block" is several of these: the request, the 256-byte data,
-// the 2-byte checksum, and the 1-byte ack, each a separate session).
+// nothing after it changes this again short of a power cycle, 6=bridging a
+// Becker port (see drivewire_becker_main()).  session_count increments once
+// per detected knock (so once per session of any kind - a full sector "block"
+// is several of these: the request, the 256-byte data, the 2-byte checksum,
+// and the 1-byte ack, each a separate session), and in phase 6 once per byte
+// received from the server.
 static volatile uint8_t  s_debug_main_phase;
 static volatile uint32_t s_debug_session_count;
-// Increments on every pass of drivewire_poll_addr(), the most fundamental,
+// Increments on every pass of drivewire_poll_addr(), or of
+// drivewire_becker_main()'s loop in phase 6 - the most fundamental,
 // frequently-hit code in the plugin - a definitive "is anything at all still
 // executing" signal, independent of which higher-level function (do_read,
 // do_write, wait_for_knock, wait_for_ack) is
@@ -520,6 +540,9 @@ enum {
     DW_ERR_STALE_RX,           // arg: bytes discarded - see drivewire_discard_stale()
     DW_ERR_GRUB,               // arg: (step << 8) | ora_result_t, step 1 chip 1, 2 X1, 3 chip 0; 0x100 alone, a bad check byte
                                // - see drivewire_do_grub()
+    DW_ERR_BECKER,             // arg: 0x100 SCS* not idling high, 0x200 | the port start's ora_result_t,
+                               // 0x300 a reply byte lost to a full queue, 0x400 | the entries lookup's
+                               // ora_result_t - see drivewire_becker_main()
 };
 static volatile struct {
     uint8_t  code;
@@ -615,7 +638,7 @@ static bool dbc_header_looks_like_push(const uint8_t header[DBC_HEADER_LEN]) {
 
 // Brings up UART1 on GPIO40 (TX) / GPIO41 (RX) at DW_UART_BAUD, 8-N-1.
 //
-// GPIO40/41 are this board's SEL_C/SEL_D image-select pads.  The firmware's
+// GPIO40/41 are this board's SEL_A/SEL_B image-select pads.  The firmware's
 // own disable_sel_pins() clears their pull-ups/downs once boot's jumper read
 // is done, and the core firmware deliberately excludes them from its GPIO
 // use tracking (see firmware/src/plugin.c) - they are meant to be reclaimed
@@ -2255,7 +2278,7 @@ __attribute__((always_inline)) static inline uint8_t drivewire_grub_byte(const g
 //
 //   the flash slot (plugins excluded) of the ROM for chip 0, the socket;
 //   the flash slot of the ROM for chip 1, on the cartridge select, or 0xFF;
-//   flags - bit 0 answers the cartridge select;
+//   flags - bit 0 answers the cartridge select, bit 2 a Becker port on SCS*;
 //   a check byte, the other three summed and XORed with 0x5A.
 //
 // The menu is running from the CoCo's own RAM by then, polling the reset
@@ -2264,6 +2287,15 @@ __attribute__((always_inline)) static inline uint8_t drivewire_grub_byte(const g
 // it, the whole entry is in place.  Returns, for the caller to wait for the
 // next knock, only where the entry wasn't loaded; the menu times out and says
 // so.
+//
+// A Becker port starts ahead of the copies: starting it doubles the table
+// entries for R/W's two levels, which the copies then write both of.  The
+// port can't be stopped, so only an entry that asks for it gets it - one that
+// leaves SCS* to a real cartridge, a floppy controller at $FF40 say, must not.
+// A port that won't start is recorded and the entry loads anyway.
+__attribute__((noinline)) static bool drivewire_becker_start(void);
+__attribute__((noinline, noreturn)) static void drivewire_becker_main(void);
+
 __attribute__((noinline)) static void drivewire_do_grub(const grub_filter_t *f) {
     uint8_t b[4];
     for (unsigned i = 0; i < 4u; i++) {
@@ -2275,6 +2307,7 @@ __attribute__((noinline)) static void drivewire_do_grub(const grub_filter_t *f) 
     }
 
     ora_result_t rc;
+    bool becker = (b[2] & 0x04u) != 0u && drivewire_becker_start();
     bool chip1 = (b[1] != 0xFFu);
     if (chip1) {
         rc = s_copy_flash_chip(b[1], ORA_FLASH_SLOT_FLAG_EXCLUDE_PLUGINS, 0u,
@@ -2296,10 +2329,165 @@ __attribute__((noinline)) static void drivewire_do_grub(const grub_filter_t *f) 
         return;
     }
 
-    // The entry now runs, and nothing in it speaks to this plugin yet, so stop
+    if (becker) {
+        drivewire_becker_main();
+    }
+
+    // The entry now runs, and nothing in it speaks to this plugin, so stop
     // watching the bus, as after "!LDCART!".  A power cycle brings the menu
     // back.
     for (;;) {
+        ORA_TEST_YIELD();
+    }
+}
+
+// Starts the Becker port, or records why it can't and returns false.
+//
+// SCS* must idle high: an X pin nothing is wired to is pulled low, which the
+// port would take for SCS* held active, and it would then drive the bus on
+// every read cycle while R/W is high.
+__attribute__((noinline)) static bool drivewire_becker_start(void) {
+    ora_gpio_info_t info = { .size = sizeof(ora_gpio_info_t) };
+    if (s_start_aux == NULL || s_aux_entries == NULL || s_gpio_query == NULL ||
+        s_gpio_query(BECKER_SCS_GPIO, &info) != ORA_RESULT_OK || info.level == 0u) {
+        drivewire_error(DW_ERR_BECKER, 0x100u);
+        return false;
+    }
+    ora_result_t rc = s_start_aux(BECKER_SCS_GPIO, BECKER_RW_GPIO, 0u);
+    if (rc != ORA_RESULT_OK) {
+        drivewire_error(DW_ERR_BECKER, (uint16_t)(0x200u | rc));
+        return false;
+    }
+    s_write_aux(BECKER_STATUS_ADDR, 0u);
+
+    // Nothing reads UART1 while the menu runs, so whatever reached it then -
+    // line noise, the ESP32 starting up - sits in its FIFO, and may have
+    // overrun it.  None of it is a reply to the CoCo.
+    while (!(UART_REG(DW_UART_BASE, UART_FR_OFFSET) & UART_FR_RXFE)) {
+        (void)UART_REG(DW_UART_BASE, UART_DR_OFFSET);
+    }
+    UART_REG(DW_UART_BASE, UART_RSR_OFFSET) = 0;
+    return true;
+}
+
+// Bridges the Becker port to UART1, for an entry running a stock Becker
+// HDB-DOS, such as toolshed's hdbdw3bck.  A plain byte pipe: each write to
+// $FF42 goes out on TX, and the bytes the server sends come back one at a time
+// through $FF42, with $FF41's bit 1 set while one waits.
+//
+// The CoCo polls $FF41 and reads $FF42 when it's set, 26us apart on a CoCo 2,
+// 13us at a CoCo 3's double speed.  So after each $FF42 read the next byte, or
+// a clear status, must be in place before its next poll: a status still set
+// with the old byte in $FF42 hands it over twice.  ora_write_aux_port() takes
+// tens of microseconds, far too long, so the two registers' table entries and
+// the data pin mapping are looked up once, here, and each update is a few
+// stores.  They live on this frame rather than in statics, which have no room:
+// grub mode, the only way here, starts with the whole stack.
+//
+// Received bytes queue in s_read_buf, idle in grub mode, as the plugin's RAM
+// has no room for another 256 bytes.  A sector's reply is 256 bytes, which the
+// queue holds exactly, and the CoCo starts taking them as they arrive.
+// TIMER0's raw microsecond count, low word.
+#define BECKER_TIMERAWL (*(volatile uint32_t *)(0x400b0000u + 0x28u))
+
+// Most table entries a Becker register's byte can have.  One ROM's own count
+// is 2: the boot slot's free GPIOs are R/W, released by the port.
+#define BECKER_MAX_ENTRIES 4u
+
+// Where a Becker register's byte lives, to set it in a few stores - see
+// drivewire_becker_main().
+typedef struct {
+    uint8_t *entry[BECKER_MAX_ENTRIES];
+    uint8_t  count;
+} becker_reg_t;
+
+// Stores logical byte value in reg, through the data pin mapping phys_bit.
+static inline void drivewire_becker_set(const becker_reg_t *reg, const uint8_t *phys_bit,
+                                        uint8_t value) {
+    uint8_t phys = 0;
+    for (unsigned n = 0; n < 8u; n++) {
+        if (value & (1u << n)) {
+            phys |= phys_bit[n];
+        }
+    }
+    for (unsigned i = 0; i < reg->count; i++) {
+        *(volatile uint8_t *)reg->entry[i] = phys;
+    }
+}
+
+__attribute__((noinline, noreturn)) static void drivewire_becker_main(void) {
+    uint8_t  head = 0;      // the byte in $FF42, while shown
+    uint16_t count = 0;     // bytes queued, the shown one included
+    bool     shown = false; // $FF42 holds s_read_buf[head], $FF41 says so
+
+    becker_reg_t status;
+    becker_reg_t data;
+    uint8_t phys_bit[8];
+    ora_map_data_to_phys_fn_t map = s_lookup_fn(ORA_ID_MAP_DATA_TO_PHYS);
+    for (unsigned n = 0; n < 8u; n++) {
+        phys_bit[n] = map((uint8_t)(1u << n));
+    }
+    ora_result_t rc = s_aux_entries(BECKER_STATUS_ADDR, status.entry, BECKER_MAX_ENTRIES, &status.count);
+    if (rc == ORA_RESULT_OK) {
+        rc = s_aux_entries(BECKER_DATA_ADDR, data.entry, BECKER_MAX_ENTRIES, &data.count);
+    }
+    if (rc != ORA_RESULT_OK) {
+        drivewire_error(DW_ERR_BECKER, (uint16_t)(0x400u | rc));
+        for (;;) {
+            ORA_TEST_YIELD();
+        }
+    }
+
+    s_debug_main_phase = 6u;
+    s_cart_received_len = 0u;
+    for (;;) {
+        s_debug_heartbeat++;
+        drivewire_check_uart_rx();
+        while (!(UART_REG(DW_UART_BASE, UART_FR_OFFSET) & UART_FR_RXFE)) {
+            uint8_t b = (uint8_t)UART_REG(DW_UART_BASE, UART_DR_OFFSET);
+            s_debug_session_count++;
+            if (count == sizeof(s_read_buf)) {
+                drivewire_error(DW_ERR_BECKER, 0x300u);
+                continue;
+            }
+            s_read_buf[(uint8_t)(head + count)] = b;
+            count++;
+        }
+
+        // One access a pass, and UART1 drained between each: the CoCo polls
+        // $FF41 every 11us or so while it reads, and handling every waiting
+        // access first starved the UART until its FIFO overran.
+        // Diagnostic, for now: the slowest a $FF42 read took to answer, from
+        // taking its capture, in microseconds, in s_cart_received_len, which
+        // only a cartridge push otherwise uses.
+        uint32_t start = BECKER_TIMERAWL;
+        ora_aux_port_access_t a;
+        if (s_read_aux(&a) == ORA_RESULT_OK &&
+            (a.addr & BECKER_REG_MASK) == (BECKER_DATA_ADDR & BECKER_REG_MASK)) {
+            if (a.is_write) {
+                drivewire_uart_putc(a.data);
+            } else if (shown) {
+                // Taken: the next byte, or nothing waiting.
+                head++;
+                count--;
+                if (count != 0u) {
+                    drivewire_becker_set(&data, phys_bit, s_read_buf[head]);
+                } else {
+                    drivewire_becker_set(&status, phys_bit, 0u);
+                    shown = false;
+                }
+                uint32_t took = BECKER_TIMERAWL - start;
+                if (took > s_cart_received_len) {
+                    s_cart_received_len = (uint16_t)took;
+                }
+            }
+        }
+
+        if (!shown && count != 0u) {
+            drivewire_becker_set(&data, phys_bit, s_read_buf[head]);
+            drivewire_becker_set(&status, phys_bit, BECKER_STATUS_READY);
+            shown = true;
+        }
         ORA_TEST_YIELD();
     }
 }
@@ -2350,6 +2538,11 @@ static void drivewire_setup(ora_lookup_fn_t ora_lookup_fn) {
     s_lookup_fn         = ora_lookup_fn;
     s_copy_flash_chip   = ora_lookup_fn(ORA_ID_LOCAL_COPY_FLASH_CHIP_TO_RAM_CHIP);
     s_set_x_pin_enabled = ora_lookup_fn(ORA_ID_LOCAL_SET_X_PIN_ENABLED);
+    s_start_aux         = ora_lookup_fn(ORA_ID_LOCAL_START_AUX_PORT);
+    s_read_aux          = ora_lookup_fn(ORA_ID_LOCAL_READ_AUX_PORT);
+    s_write_aux         = ora_lookup_fn(ORA_ID_LOCAL_WRITE_AUX_PORT);
+    s_aux_entries       = ora_lookup_fn(ORA_ID_LOCAL_GET_AUX_PORT_ENTRIES);
+    s_gpio_query        = ora_lookup_fn(ORA_ID_GPIO_QUERY);
     s_grub_mode = s_copy_flash_chip != NULL && s_set_x_pin_enabled != NULL &&
                   s_set_x_pin_enabled(1u, 0u) == ORA_RESULT_OK;
 
