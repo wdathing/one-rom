@@ -25,6 +25,13 @@
 #define SM_ADDR_MONITOR_CS_MONITOR  2
 #define SM_LED                      0
 
+// The aux port (pio_start_aux_port(), a local extension): its output enable
+// shares the CS/Data block, the only block that can drive the data pins, and
+// its capture shares the address block, each after the address monitor's
+// SM and instructions.
+#define SM_AUX_PORT_OE              3
+#define SM_AUX_PORT_CAPTURE         2
+
 // IRQs
 
 // Used by the RBCP address monitor PIOs to signal CS going active

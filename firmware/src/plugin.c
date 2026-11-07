@@ -1245,6 +1245,36 @@ static uint8_t ora_gpio_get_use(uint8_t gpio) {
     return use;
 }
 
+ora_result_t ora_start_aux_port(uint8_t select_gpio, uint8_t rw_gpio, uint32_t flags) {
+    if (select_gpio >= MAX_GPIOS || rw_gpio >= MAX_GPIOS ||
+        select_gpio == rw_gpio ||
+        flags != 0u) {
+        return ORA_RESULT_INVALID_ARG;
+    }
+    if (ora_gpio_use_is_busy(ora_gpio_get_use(select_gpio)) ||
+        ora_gpio_use_is_busy(ora_gpio_get_use(rw_gpio))) {
+        return ORA_RESULT_GPIO_IN_USE;
+    }
+    return pio_start_aux_port(CURRENT_SLOT, select_gpio, rw_gpio, flags);
+}
+
+ora_result_t ora_read_aux_port(ora_aux_port_access_t *access_out) {
+    return pio_read_aux_port(CURRENT_SLOT, access_out);
+}
+
+ora_result_t ora_write_aux_port(uint32_t addr, uint8_t data) {
+    return pio_write_aux_port(addr, data);
+}
+
+ora_result_t ora_get_aux_port_entries(
+    uint32_t addr,
+    uint8_t **entries_out,
+    uint8_t max,
+    uint8_t *count_out
+) {
+    return pio_get_aux_port_entries(addr, entries_out, max, count_out);
+}
+
 ora_result_t ora_gpio_set(uint8_t gpio, uint8_t state, uint32_t flags) {
     if (gpio >= MAX_GPIOS) {
         return ORA_RESULT_INVALID_ARG;
@@ -1961,6 +1991,14 @@ void *ora_fn_lookup(api_id_t id) {
             return ora_setup_address_monitor_all_chips;
         case ORA_ID_LOCAL_COPY_FLASH_CHIP_TO_RAM_CHIP:
             return ora_copy_flash_chip_to_ram_chip;
+        case ORA_ID_LOCAL_START_AUX_PORT:
+            return ora_start_aux_port;
+        case ORA_ID_LOCAL_READ_AUX_PORT:
+            return ora_read_aux_port;
+        case ORA_ID_LOCAL_WRITE_AUX_PORT:
+            return ora_write_aux_port;
+        case ORA_ID_LOCAL_GET_AUX_PORT_ENTRIES:
+            return ora_get_aux_port_entries;
 
         // Deprecated functions
         case ORA_ID_GET_FIRMWARE_INFO:

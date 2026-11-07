@@ -919,12 +919,40 @@ typedef struct {
     uint32_t free;
 } chip_table_masks_t;
 
+// Whether gpio's input is forced to a level right now.  The slot's overrides
+// say what boot forced, and the aux port releases its two lines from that.
+static uint8_t pio_input_forced(uint8_t gpio) {
+#if !defined(APIO_EMULATION)
+    uint32_t ovr = APIO_GPIO_CTRL(gpio) & APIO_GPIO_CTRL_INOVER_MASK;
+    return (ovr == APIO_GPIO_CTRL_INOVER_LOW) || (ovr == APIO_GPIO_CTRL_INOVER_HIGH);
+#else // APIO_EMULATION
+    return _apio_emulated_gpios.force_input_low[gpio] ||
+           _apio_emulated_gpios.force_input_high[gpio];
+#endif // !APIO_EMULATION
+}
+
+static uint8_t pio_input_forced_high(uint8_t gpio) {
+#if !defined(APIO_EMULATION)
+    return (APIO_GPIO_CTRL(gpio) & APIO_GPIO_CTRL_INOVER_MASK) == APIO_GPIO_CTRL_INOVER_HIGH;
+#else // APIO_EMULATION
+    return _apio_emulated_gpios.force_input_high[gpio];
+#endif // !APIO_EMULATION
+}
+
+// The pseudo-chip pio_chip_table_masks() takes for a Multi slot's entries with
+// no chip selected, which only the aux port serves.
+#define PIO_AUX_PORT_CHIP 0xFFu
+
+// Built for size: off the serving and per-byte paths, and the firmware is
+// within a few hundred bytes of its 48KB.
+__attribute__((optimize("Os")))
 static ora_result_t pio_chip_table_masks(
     const onerom_rom_slot_t *slot,
     uint8_t chip,
     chip_table_masks_t *out
 ) {
-    if (chip >= slot->rom_count) {
+    uint8_t aux = (chip == PIO_AUX_PORT_CHIP);
+    if (!aux && chip >= slot->rom_count) {
         return ORA_RESULT_INVALID_ARG;
     }
 
@@ -942,12 +970,16 @@ static ora_result_t pio_chip_table_masks(
     if (multi && word_16) {
         return ORA_RESULT_NOT_SUPPORTED;
     }
+    // Only a Multi slot's select is one-hot, leaving a clear none-selected.
+    if (aux && !multi) {
+        return ORA_RESULT_NOT_SUPPORTED;
+    }
 
     uint32_t fixed = 0;
     uint32_t set   = 0;
     uint32_t clear = 0;
 
-    uint8_t lines = pio_chip_addr_lines(slot, chip);
+    uint8_t lines = pio_chip_addr_lines(slot, aux ? 0u : chip);
     for (uint8_t n = 0; n < lines; n++) {
         fixed |= 1u << (pin_map->addr[n] - addr_base);
     }
@@ -961,7 +993,9 @@ static ora_result_t pio_chip_table_masks(
         uint32_t all = sel.chip[0] | sel.chip[1] | sel.chip[2];
         fixed |= all;
         clear |= all;
-        set   |= sel.chip[chip];
+        if (!aux) {
+            set |= sel.chip[chip];
+        }
     } else {
         uint8_t cs_base = cs_alg->gpio_base + cs_alg->base_cs_pin;
         for (uint8_t i = 0; i < cs_alg->num_cs_pins; i++) {
@@ -976,7 +1010,8 @@ static ora_result_t pio_chip_table_masks(
         }
     }
 
-    // A GPIO an override holds at one level reads only that level.
+    // A GPIO an override holds at one level reads only that level, while it
+    // still does: one the aux port has released reads both, and is free.
     const onerom_alg_override_config_t *ovr = slot->alg->gpio_override_config;
     if (ovr != NULL && ovr != (const onerom_alg_override_config_t *)0xFFFFFFFF) {
         for (uint8_t i = 0; i < ovr->param_len; i++) {
@@ -986,7 +1021,7 @@ static ora_result_t pio_chip_table_masks(
                 continue;
             }
             uint32_t bit = 1u << (g - addr_base);
-            if ((fixed & bit) != 0u) {
+            if ((fixed & bit) != 0u || !pio_input_forced(g)) {
                 continue;
             }
             if (mode == GPIO_OVER_LOW) {
@@ -1028,6 +1063,9 @@ static inline uint32_t pio_chip_table_index(
 // The chip a Multi slot read selected, and the address it read within that
 // chip.  A Single or Banked slot has only chip 0, and this is
 // pio_demangle_addr() with its control pin check.
+// Built for size: off the serving and per-byte paths, and the firmware is
+// within a few hundred bytes of its 48KB.
+__attribute__((optimize("Os")))
 ora_result_t pio_demangle_addr_chip(
     const onerom_rom_slot_t *slot,
     uint32_t physical_addr,
@@ -1114,6 +1152,9 @@ static void pio_set_input_override(uint8_t gpio, uint32_t ovr) {
 // state machine reads - is forced first and restored last, so that machine
 // never sees the X pin selected while the address machine's copy still reads
 // it forced.
+// Built for size: off the serving and per-byte paths, and the firmware is
+// within a few hundred bytes of its 48KB.
+__attribute__((optimize("Os")))
 ora_result_t pio_set_x_pin_enabled(
     const onerom_rom_slot_t *slot,
     uint8_t x_pin,
@@ -2119,6 +2160,394 @@ ora_result_t pio_start_address_monitor(void) {
 
 volatile uint32_t * volatile *pio_get_address_monitor_ring_write_pos(void) {
     return monitor_ring_write_pos_slot();
+}
+
+// ---------------------------------------------------------------------------
+// Aux port (local extension) - see ora_start_aux_port_fn_t for what it does.
+//
+// Two state machines, neither of which touches serving's:
+//
+// - Output enable, in the CS/Data block, the one whose function select owns
+//   the data pins.  While the select is active and R/W is high it makes the
+//   data pins outputs.  Serving's CS machine sets the pins' direction only as
+//   its own select changes (piorom2.c), and its data machine keeps driving
+//   the table's byte for whatever address is on the bus, selected or not.  So
+//   on an aux port read, with no chip selected, the pins carry the table's
+//   no-chip entry for that address, and this machine only has to switch them
+//   on.
+// - Capture, in the address block.  It samples every GPIO the block reaches
+//   for as long as the select is active, and as it goes inactive pushes the
+//   sample before last - see AUX_PORT_SAMPLE_DELAY.  For a write, the data
+//   bus then holds the byte written.
+//
+// The firmware keeps no state for the port beyond the two machines' own
+// registers, from which it reads back what it needs.
+// ---------------------------------------------------------------------------
+
+// Instructions the address monitor's address-read SM adds after serving's in
+// the address block - see pio_setup_address_monitor_pios().
+#define MONITOR_ADDR_READ_INSTRS 2
+
+#define AUX_PORT_OE_INSTRS       7
+#define AUX_PORT_CAPTURE_INSTRS  11
+
+// The capture keeps the sample before last, a loop of 4 + this many cycles
+// apart, so the one it pushes was taken that long before the select was seen
+// going inactive.  The last sample alone is too late: a CoCo's SCS* rises after
+// E falls, and a 6809 holds its write data only some 30ns past E.  10 cycles,
+// 67ns at 150MHz, falls well inside the write data's window at a CoCo 2's
+// 0.89MHz and at a CoCo 3's 1.79MHz.
+#define AUX_PORT_SAMPLE_DELAY    6
+
+#if !REAL_HARDWARE
+// There is no RX FIFO register to pop under emulation, so the harness supplies
+// one, popping epio's.
+static aux_port_rx_pop_fn_t s_host_aux_port_rx_pop = NULL;
+
+void set_host_aux_port_rx_pop(aux_port_rx_pop_fn_t fn) {
+    s_host_aux_port_rx_pop = fn;
+}
+#endif // !REAL_HARDWARE
+
+static uint8_t pio_sm_enabled(uint8_t block, uint8_t sm) {
+#if !defined(APIO_EMULATION)
+    uint32_t ctrl = (block == 0) ? APIO0_CTRL : (block == 1) ? APIO1_CTRL : APIO2_CTRL;
+    return (ctrl & (1u << sm)) != 0u;
+#else // APIO_EMULATION
+    return (_apio_emulated_pio.enabled_sms[block] & (1u << sm)) != 0u;
+#endif // !APIO_EMULATION
+}
+
+static uint32_t pio_sm_execctrl(uint8_t block, uint8_t sm) {
+#if !defined(APIO_EMULATION)
+    volatile pio_sm_reg_t *reg = (block == 0) ? APIO0_SM_REG(sm)
+                               : (block == 1) ? APIO1_SM_REG(sm)
+                               : APIO2_SM_REG(sm);
+    return reg->execctrl;
+#else // APIO_EMULATION
+    return _apio_emulated_pio.pio_sm_reg[block][sm].execctrl;
+#endif // !APIO_EMULATION
+}
+
+// Pops sm's RX FIFO into *out, returning 0 if it was empty.
+static uint8_t pio_rx_pop(uint8_t block, uint8_t sm, uint32_t *out) {
+#if REAL_HARDWARE
+    uint32_t fstat = (block == 0) ? APIO0_FSTAT : (block == 1) ? APIO1_FSTAT : APIO2_FSTAT;
+    if ((fstat & APIO_FSTAT_SMX_RX_EMPTY_BIT(sm)) != 0u) {
+        return 0;
+    }
+    *out = APIO_RXF_AT(block, sm);
+    return 1;
+#else // !REAL_HARDWARE
+    if (s_host_aux_port_rx_pop == NULL) {
+        return 0;
+    }
+    return s_host_aux_port_rx_pop(block, sm, out);
+#endif // REAL_HARDWARE
+}
+
+// Releases gpio's input if it is forced.  The slot's tables hold the bytes for
+// a forced GPIO in the address window at its forced level only, so first each
+// entry is copied to the other level, in every RAM slot.  Serving reads only
+// the forced level until the release, so the copy can run while it serves.
+// Built for size: off the serving and per-byte paths, and the firmware is
+// within a few hundred bytes of its 48KB.
+__attribute__((optimize("Os")))
+static void pio_release_forced_input(const onerom_rom_slot_t *slot, uint8_t gpio) {
+    if (!pio_input_forced(gpio)) {
+        return;
+    }
+    const onerom_alg_addr_config_t *addr_alg = slot->alg->alg_addr;
+    uint8_t win = addr_alg->gpio_base + addr_alg->base_addr_pin;
+    if (gpio >= win && gpio < win + addr_alg->num_addr_pins) {
+        uint32_t bit = 1u << (gpio - win);
+        uint32_t from = pio_input_forced_high(gpio) ? bit : 0u;
+        uint8_t count = ora_get_ram_slot_count();
+        for (uint8_t i = 0; i < count; i++) {
+            uint32_t addr;
+            uint32_t size;
+            if (ora_get_ram_slot_info(i, &addr, &size, NULL) != ORA_RESULT_OK) {
+                continue;
+            }
+#if REAL_HARDWARE
+            uint8_t *table = (uint8_t *)(uintptr_t)addr;
+#else
+            uint8_t *table = sram_to_host(addr);
+#endif
+            for (uint32_t idx = 0; idx < size; idx++) {
+                if ((idx & bit) == from) {
+                    table[idx ^ bit] = table[idx];
+                }
+            }
+        }
+    }
+    pio_set_input_override(gpio, 0);
+}
+
+// Built for size: off the serving and per-byte paths, and the firmware is
+// within a few hundred bytes of its 48KB.
+__attribute__((optimize("Os")))
+ora_result_t pio_start_aux_port(
+    const onerom_rom_slot_t *slot,
+    uint8_t select_gpio,
+    uint8_t rw_gpio,
+    uint32_t flags
+) {
+    if (slot->slot_type != ROM_SLOT_TYPE_MULTI_ROM) {
+        return ORA_RESULT_NOT_SUPPORTED;
+    }
+
+    const onerom_alg_cs_config_t   *cs_alg   = slot->alg->alg_cs;
+    const onerom_alg_addr_config_t *addr_alg = slot->alg->alg_addr;
+    const onerom_rom_pin_map_t     *pin_map  = slot->roms[0]->pin_map;
+    uint8_t cs_block   = GET_PIO_BLOCK_INFO(RUNTIME->cs_data_pio_block_info);
+    uint8_t addr_block = GET_PIO_BLOCK_INFO(RUNTIME->addr_pio_block_info);
+    uint8_t cs_base    = cs_alg->gpio_base;
+    uint8_t addr_base  = addr_alg->gpio_base;
+    (void)flags;
+
+    if (pio_sm_enabled(cs_block, SM_AUX_PORT_OE) ||
+        pio_sm_enabled(addr_block, SM_AUX_PORT_CAPTURE)) {
+        return ORA_RESULT_ERROR;
+    }
+
+    // Each machine reads its lines relative to its own block's GPIOBASE, and
+    // the capture machine must see the data pins as well as the select.
+    if (select_gpio < cs_base || select_gpio >= cs_base + 32u ||
+        rw_gpio < cs_base || rw_gpio >= cs_base + 32u ||
+        select_gpio < addr_base || select_gpio >= addr_base + 32u) {
+        return ORA_RESULT_INVALID_ARG;
+    }
+    for (uint8_t n = 0; n < 8u; n++) {
+        uint8_t g = pin_map->data[n];
+        if (g < addr_base || g >= addr_base + 32u) {
+            return ORA_RESULT_NOT_SUPPORTED;
+        }
+    }
+
+    // After serving's instructions and the address monitor's, whether or not
+    // the monitor has been set up, so the two never collide.  Serving's SMs
+    // are recorded; the monitor's are fixed and differ from the port's.
+    uint8_t cs_pos = GET_PIO_BLOCK_INSTR_LEN(RUNTIME->cs_data_pio_block_info) +
+                     monitor_cs_instrs(cs_alg->alg);
+    uint8_t addr_pos = GET_PIO_BLOCK_INSTR_LEN(RUNTIME->addr_pio_block_info) +
+                       MONITOR_ADDR_READ_INSTRS;
+    if ((uint32_t)cs_pos + AUX_PORT_OE_INSTRS > APIO_MAX_PIO_INSTRS ||
+        (uint32_t)addr_pos + AUX_PORT_CAPTURE_INSTRS > APIO_MAX_PIO_INSTRS ||
+        CHECK_PIO_SM_INFO(RUNTIME->cs_data_pio_sm_info, SM_AUX_PORT_OE) ||
+        CHECK_PIO_SM_INFO(RUNTIME->addr_pio_sm_info, SM_AUX_PORT_CAPTURE)) {
+        return ORA_RESULT_NOT_SUPPORTED;
+    }
+
+    // A forced input reads its forced level, not the line, so release it.
+    // pio_chip_table_masks() sees the release, and from here on writes both
+    // levels' entries.
+    pio_release_forced_input(slot, select_gpio);
+    pio_release_forced_input(slot, rw_gpio);
+
+    APIO_ASM_CONTINUE();
+
+    //
+    // Output enable
+    //
+    // The select is active low.
+    uint8_t sel_cs = (uint8_t)(select_gpio - cs_base);
+
+    APIO_SET_BLOCK_FROM_VAR(cs_block, cs_pos);
+    APIO_SET_SM(SM_AUX_PORT_OE);
+
+    APIO_WRAP_BOTTOM();
+    APIO_LABEL_NEW(oe_idle);
+    APIO_ADD_INSTR(APIO_WAIT_GPIO_LOW(sel_cs));
+    APIO_LABEL_NEW_OFFSET(oe_read, 3);
+    APIO_ADD_INSTR(APIO_JMP_PIN(APIO_LABEL(oe_read)));
+    // A write: One ROM keeps off the bus until it ends.
+    APIO_ADD_INSTR(APIO_WAIT_GPIO_HIGH(sel_cs));
+    APIO_ADD_INSTR(APIO_JMP(APIO_LABEL(oe_idle)));
+    // oe_read:
+    APIO_ADD_INSTR(APIO_MOV_PINDIRS_NOT_NULL);
+    APIO_ADD_INSTR(APIO_WAIT_GPIO_HIGH(sel_cs));
+    APIO_WRAP_TOP();
+    APIO_ADD_INSTR(APIO_MOV_PINDIRS_NULL);
+
+    APIO_SM_CLKDIV_SET(1, 0);
+    APIO_SM_EXECCTRL_SET(APIO_EXECCTRL_JMP_PIN(rw_gpio - cs_base));
+    APIO_SM_SHIFTCTRL_SET(0);
+    APIO_SM_PINCTRL_SET(
+        APIO_OUT_COUNT(cs_alg->num_data_pins) |
+        APIO_OUT_BASE(cs_alg->base_data_pin)
+    );
+    APIO_SM_JMP_TO_START();
+
+    APIO_END_BLOCK_FROM(cs_pos);
+
+    //
+    // Capture
+    //
+    // Both edges are confirmed by a second look, as the address monitor's are:
+    // a glitch inactive mid-access would otherwise capture a write twice, the
+    // first time before its data is on the bus.
+    uint8_t sel_addr = (uint8_t)(select_gpio - addr_base);
+
+    APIO_SET_BLOCK_FROM_VAR(addr_block, addr_pos);
+    APIO_SET_SM(SM_AUX_PORT_CAPTURE);
+
+    // JMP PIN jumps on the select reading high, inactive.
+    APIO_WRAP_BOTTOM();
+    APIO_LABEL_NEW(cap_idle);
+    APIO_ADD_INSTR(APIO_WAIT_GPIO_LOW(sel_addr));
+    APIO_ADD_INSTR(APIO_JMP_PIN(APIO_LABEL(cap_idle)));
+    APIO_ADD_INSTR(APIO_IN_PINS(32));
+    // The ISR is the latest sample, Y the one before.  IN rather than MOV from
+    // PINS, whose IN_COUNT of 0 a device reads as 32 pins and epio as none.
+    APIO_LABEL_NEW(cap_active);
+    APIO_ADD_INSTR(APIO_ADD_DELAY(APIO_MOV_Y_ISR, AUX_PORT_SAMPLE_DELAY));
+    APIO_ADD_INSTR(APIO_IN_PINS(32));
+    APIO_LABEL_NEW_OFFSET(cap_releasing, 2);
+    APIO_ADD_INSTR(APIO_JMP_PIN(APIO_LABEL(cap_releasing)));
+    APIO_ADD_INSTR(APIO_JMP(APIO_LABEL(cap_active)));
+    // cap_releasing:
+    APIO_LABEL_NEW_OFFSET(cap_released, 2);
+    APIO_ADD_INSTR(APIO_JMP_PIN(APIO_LABEL(cap_released)));
+    APIO_ADD_INSTR(APIO_JMP(APIO_LABEL(cap_active)));
+    // cap_released:
+    APIO_ADD_INSTR(APIO_MOV_ISR_Y);
+    APIO_WRAP_TOP();
+    APIO_ADD_INSTR(APIO_PUSH_BLOCK);
+
+    APIO_SM_CLKDIV_SET(1, 0);
+    APIO_SM_EXECCTRL_SET(APIO_EXECCTRL_JMP_PIN(sel_addr));
+    APIO_SM_SHIFTCTRL_SET(APIO_IN_SHIFTDIR_L);
+    APIO_SM_PINCTRL_SET(APIO_IN_BASE(0));
+    APIO_SM_JMP_TO_START();
+
+    APIO_END_BLOCK_FROM(addr_pos);
+
+    // Capture first, so no read is answered that isn't captured.
+    pio_enable_sms(addr_block, 1u << SM_AUX_PORT_CAPTURE);
+    pio_enable_sms(cs_block, 1u << SM_AUX_PORT_OE);
+
+    return ORA_RESULT_OK;
+}
+
+// Built for size: off the serving and per-byte paths, and the firmware is
+// within a few hundred bytes of its 48KB.
+__attribute__((optimize("Os")))
+ora_result_t pio_read_aux_port(
+    const onerom_rom_slot_t *slot,
+    ora_aux_port_access_t *access_out
+) {
+    if (access_out == NULL) {
+        return ORA_RESULT_INVALID_ARG;
+    }
+
+    uint8_t cs_block   = GET_PIO_BLOCK_INFO(RUNTIME->cs_data_pio_block_info);
+    uint8_t addr_block = GET_PIO_BLOCK_INFO(RUNTIME->addr_pio_block_info);
+    if (!pio_sm_enabled(addr_block, SM_AUX_PORT_CAPTURE)) {
+        return ORA_RESULT_ERROR;
+    }
+
+    uint32_t raw;
+    if (!pio_rx_pop(addr_block, SM_AUX_PORT_CAPTURE, &raw)) {
+        return ORA_RESULT_NOT_READY;
+    }
+
+    // Bit n of the sample is GPIO addr_base + n.  R/W is the GPIO the output
+    // enable machine jumps on, relative to its own block's base.
+    const onerom_rom_pin_map_t *pin_map = slot->roms[0]->pin_map;
+    uint8_t addr_base = slot->alg->alg_addr->gpio_base;
+    uint8_t rw_gpio = (uint8_t)(APIO_EXECCTRL_JMP_PIN_FROM_REG(
+                          pio_sm_execctrl(cs_block, SM_AUX_PORT_OE)) +
+                          slot->alg->alg_cs->gpio_base);
+
+    uint32_t addr = 0;
+    uint8_t lines = pio_chip_addr_lines(slot, 0);
+    for (uint8_t n = 0; n < lines; n++) {
+        addr |= ((raw >> (pin_map->addr[n] - addr_base)) & 1u) << n;
+    }
+    uint8_t data = 0;
+    for (uint8_t n = 0; n < 8u; n++) {
+        data |= (uint8_t)(((raw >> (pin_map->data[n] - addr_base)) & 1u) << n);
+    }
+
+    access_out->addr        = addr;
+    access_out->data        = data;
+    access_out->is_write    = (uint8_t)(((raw >> (rw_gpio - addr_base)) & 1u) ^ 1u);
+    access_out->reserved[0] = 0;
+    access_out->reserved[1] = 0;
+    return ORA_RESULT_OK;
+}
+
+ora_result_t pio_write_aux_port(uint32_t addr, uint8_t data) {
+    const onerom_rom_slot_t *slot = CURRENT_SLOT;
+    if (slot->slot_type != ROM_SLOT_TYPE_MULTI_ROM) {
+        return ORA_RESULT_NOT_SUPPORTED;
+    }
+    if (addr >= slot->roms[0]->chip_size) {
+        return ORA_RESULT_INVALID_ARG;
+    }
+
+    uint8_t ram_slot;
+    if (ora_get_active_ram_slot(&ram_slot) != ORA_RESULT_OK) {
+        return ORA_RESULT_NO_SLOT_ACTIVE;
+    }
+
+    chip_writer_t w;
+    uint32_t size;
+    ora_result_t result = pio_chip_writer(ram_slot, PIO_AUX_PORT_CHIP, 1u, &size, &w);
+    if (result != ORA_RESULT_OK) {
+        return result;
+    }
+    pio_chip_write(&w, addr, data);
+    return ORA_RESULT_OK;
+}
+
+// Built for size: off the serving and per-byte paths, and the firmware is
+// within a few hundred bytes of its 48KB.
+__attribute__((optimize("Os")))
+ora_result_t pio_get_aux_port_entries(
+    uint32_t addr,
+    uint8_t **entries_out,
+    uint8_t max,
+    uint8_t *count_out
+) {
+    const onerom_rom_slot_t *slot = CURRENT_SLOT;
+    if (entries_out == NULL || count_out == NULL) {
+        return ORA_RESULT_INVALID_ARG;
+    }
+    if (slot->slot_type != ROM_SLOT_TYPE_MULTI_ROM) {
+        return ORA_RESULT_NOT_SUPPORTED;
+    }
+    if (addr >= slot->roms[0]->chip_size) {
+        return ORA_RESULT_INVALID_ARG;
+    }
+
+    uint8_t ram_slot;
+    if (ora_get_active_ram_slot(&ram_slot) != ORA_RESULT_OK) {
+        return ORA_RESULT_NO_SLOT_ACTIVE;
+    }
+
+    chip_writer_t w;
+    uint32_t size;
+    ora_result_t result = pio_chip_writer(ram_slot, PIO_AUX_PORT_CHIP, 1u, &size, &w);
+    if (result != ORA_RESULT_OK) {
+        return result;
+    }
+
+    // Every entry pio_chip_write() would write, in the same order.
+    uint32_t base = pio_chip_table_index(slot, &w.masks, addr);
+    uint32_t combo = w.masks.free;
+    uint8_t count = 0;
+    for (;;) {
+        if (count < max) {
+            entries_out[count] = w.sram + (base | combo);
+        }
+        count++;
+        if (combo == 0) break;
+        combo = (combo - 1) & w.masks.free;
+    }
+    *count_out = count;
+    return (count <= max) ? ORA_RESULT_OK : ORA_RESULT_INVALID_SIZE;
 }
 
 // Returns the number of bits used to index the ROM table — i.e. the low bits

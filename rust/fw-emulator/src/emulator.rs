@@ -53,6 +53,31 @@ unsafe extern "C" fn yield_trampoline() {
     });
 }
 
+thread_local! {
+    /// The live epio, for [`aux_port_rx_pop_trampoline`], which the firmware
+    /// calls with no context.
+    static AUX_PORT_EPIO: std::cell::Cell<*mut ffi::epio_t> =
+        const { std::cell::Cell::new(core::ptr::null_mut()) };
+}
+
+/// C-ABI seam the firmware pops the aux port's capture FIFO through under
+/// emulation, where there is no RX FIFO register: pops epio's.
+unsafe extern "C" fn aux_port_rx_pop_trampoline(block: u8, sm: u8, out: *mut u32) -> u8 {
+    let epio = AUX_PORT_EPIO.with(|e| e.get());
+    if epio.is_null() {
+        return 0;
+    }
+    // SAFETY: epio is the live instance setup_epio installed, and out is the
+    // firmware's own local.
+    unsafe {
+        if ffi::epio_rx_fifo_depth(epio, block, sm) == 0 {
+            return 0;
+        }
+        *out = ffi::epio_pop_rx_fifo(epio, block, sm);
+    }
+    1
+}
+
 /// Pristine image of `onerom_runtime_info`, captured on the first boot before
 /// firmware_main() runs.  Restored on every subsequent in-process boot to
 /// reproduce the cold-boot RAM state that Reset_Handler establishes on
@@ -349,6 +374,9 @@ impl Emulator {
         unsafe { ffi::set_host_sram_ptr(sram_ptr) };
 
         unsafe { ffi::ffi_epio_setup_dma_chain(epio, word_size) };
+
+        AUX_PORT_EPIO.with(|e| e.set(epio));
+        unsafe { ffi::set_host_aux_port_rx_pop(Some(aux_port_rx_pop_trampoline)) };
 
         self.epio = epio;
     }
@@ -1189,6 +1217,80 @@ impl Emulator {
             self.sync_input_overrides();
         }
         result
+    }
+
+    /// `ORA_ID_LOCAL_START_AUX_PORT`.  This fork's local extension.
+    ///
+    /// Arguments are passed unchecked so a test can pass invalid values.  On
+    /// success the port's state machines and the overrides it released are
+    /// applied to a live epio, where [`Self::setup_epio`] has run.
+    pub fn start_aux_port(&self, select_gpio: u8, rw_gpio: u8, flags: u32) -> OraResult {
+        let result = OraResult::from(plugin_call!(
+            ffi::api_id_t_ORA_ID_LOCAL_START_AUX_PORT,
+            ffi::ora_start_aux_port_fn_t,
+            select_gpio,
+            rw_gpio,
+            flags
+        ));
+        if result.is_ok() && !self.epio.is_null() {
+            unsafe { ffi::epio_update_from_apio(self.epio_or_panic()) };
+            self.sync_input_overrides();
+        }
+        result
+    }
+
+    /// `ORA_ID_LOCAL_READ_AUX_PORT`: the next captured access, if the call
+    /// succeeded.  This fork's local extension.
+    pub fn read_aux_port(&self) -> (OraResult, Option<ffi::ora_aux_port_access_t>) {
+        let mut access = ffi::ora_aux_port_access_t {
+            addr: 0,
+            data: 0,
+            is_write: 0,
+            reserved: [0; 2],
+        };
+        let r = OraResult::from(plugin_call!(
+            ffi::api_id_t_ORA_ID_LOCAL_READ_AUX_PORT,
+            ffi::ora_read_aux_port_fn_t,
+            &mut access as *mut ffi::ora_aux_port_access_t
+        ));
+        (r, r.is_ok().then_some(access))
+    }
+
+    /// `ORA_ID_LOCAL_READ_AUX_PORT` with a NULL output, for its refusal.
+    pub fn read_aux_port_null(&self) -> OraResult {
+        OraResult::from(plugin_call!(
+            ffi::api_id_t_ORA_ID_LOCAL_READ_AUX_PORT,
+            ffi::ora_read_aux_port_fn_t,
+            core::ptr::null_mut()
+        ))
+    }
+
+    /// `ORA_ID_LOCAL_WRITE_AUX_PORT`.  This fork's local extension.
+    pub fn write_aux_port(&self, addr: u32, data: u8) -> OraResult {
+        OraResult::from(plugin_call!(
+            ffi::api_id_t_ORA_ID_LOCAL_WRITE_AUX_PORT,
+            ffi::ora_write_aux_port_fn_t,
+            addr,
+            data
+        ))
+    }
+
+    /// `ORA_ID_LOCAL_GET_AUX_PORT_ENTRIES`: the call's result, the entry
+    /// count it reports, and the entries that fit in `max`.  This fork's local
+    /// extension.
+    pub fn get_aux_port_entries(&self, addr: u32, max: u8) -> (OraResult, u8, Vec<*mut u8>) {
+        let mut entries = vec![core::ptr::null_mut::<u8>(); max as usize];
+        let mut count: u8 = 0;
+        let r = OraResult::from(plugin_call!(
+            ffi::api_id_t_ORA_ID_LOCAL_GET_AUX_PORT_ENTRIES,
+            ffi::ora_get_aux_port_entries_fn_t,
+            addr,
+            entries.as_mut_ptr(),
+            max,
+            &mut count as *mut u8
+        ));
+        entries.truncate(count.min(max) as usize);
+        (r, count, entries)
     }
 
     /// Bring epio's GPIO input overrides into line with the apio record.

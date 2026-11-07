@@ -278,11 +278,19 @@ fn run_slot_multi(
             tests::multi::test_x_pin_disable(&emulator, &rig, board),
         );
     }
-    // Starts the address monitor, so last.
+    // Starts the address monitor, so after the rest.
     report.add(
         "multi_demangle_chip",
         tests::multi::test_demangle_chip(&emulator, &rig),
     );
+    // Starts the aux port, which only a reboot stops, so last.
+    match tests::multi::aux_port_rig(&emulator, &rig, board) {
+        Ok(port) => report.add(
+            "multi_aux_port",
+            tests::multi::test_aux_port(&emulator, &rig, &port, BOOT_SLOT),
+        ),
+        Err(why) => report.skip("multi_aux_port", &why),
+    }
 }
 
 /// Boot the firmware with chip set `set_idx` selected and run only the GPIO

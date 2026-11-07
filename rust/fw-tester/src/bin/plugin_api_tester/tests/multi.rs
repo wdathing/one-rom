@@ -10,6 +10,10 @@
 //! - `ORA_ID_LOCAL_DEMANGLE_ADDR_CHIP` says which chip a capture read.
 //! - `ORA_ID_LOCAL_SET_X_PIN_ENABLED` stops One ROM answering an X pin's chip
 //!   select, so another device on that select can.
+//! - `ORA_ID_LOCAL_START_AUX_PORT`, `ORA_ID_LOCAL_READ_AUX_PORT`,
+//!   `ORA_ID_LOCAL_WRITE_AUX_PORT` and `ORA_ID_LOCAL_GET_AUX_PORT_ENTRIES`
+//!   answer reads, and capture every access, on a select line outside the
+//!   slot: a CoCo's SCS* on the X pin a two chip slot leaves free.
 //!
 //! What a host reads is the oracle, so the writes are checked by serving: a RAM
 //! slot is filled with junk, every chip is written through the API, and each
@@ -239,13 +243,28 @@ fn read_once(
 /// `expected`, with the gap GPIOs and the chip's missing address lines all low
 /// and then all high.
 fn verify_serving(emu: &Emulator, rig: &MultiRig, k: usize, expected: &[u8]) -> Result<(), String> {
+    verify_serving_with(emu, rig, k, expected, (0, 0))
+}
+
+/// [`verify_serving`] with `extra` driven as well, on GPIOs the rig otherwise
+/// leaves alone.
+fn verify_serving_with(
+    emu: &Emulator,
+    rig: &MultiRig,
+    k: usize,
+    expected: &[u8],
+    extra: (u64, u64),
+) -> Result<(), String> {
     let chip = &rig.chips[k];
-    let floating = rig.gap_gpios | chip.extra_gpios;
+    let floating = (rig.gap_gpios | chip.extra_gpios) & !extra.0;
     let levels: &[u64] = if floating == 0 { &[0] } else { &[0, u64::MAX] };
 
     let mut errors = Vec::new();
     for &level in levels {
-        let background = driver::merge(chip.background, (floating, floating & level));
+        let background = driver::merge(
+            driver::merge(chip.background, (floating, floating & level)),
+            extra,
+        );
         let (_, failures, bus_failures, _) = run_mode(
             emu,
             &chip.cache,
@@ -838,5 +857,263 @@ pub fn test_single_slot(emu: &Emulator, slot: u8, boot_image: &[u8]) -> Result<(
         }
     }
 
+    verdict(errors)
+}
+
+/// How long before the select goes a write's byte leaves the bus.  A CoCo's
+/// SCS* rises some 20ns after E falls, against a 6809's 30ns of write data
+/// hold, but the capture's input sync and its own loop come on top: 4 cycles is
+/// a byte gone well before the select is.
+const AUX_DATA_GONE_CYCLES: u32 = 4;
+
+/// The aux port's lines, as the test wires them: the select on the X pin the
+/// slot leaves free, and R/W on a GPIO the slot forces.
+pub struct AuxPortRig {
+    select_gpio: u8,
+    /// Every GPIO the select's X pin is wired to.
+    select_mask: u64,
+    rw_gpio: u8,
+}
+
+/// The aux port's lines for a slot with a free X pin and a forced GPIO, or why
+/// the slot has none.
+pub fn aux_port_rig(emu: &Emulator, rig: &MultiRig, board: Board) -> Result<AuxPortRig, String> {
+    let free = |g: u8| {
+        let (result, info) = emu.gpio_query(g);
+        result.is_ok() && info.gpio_use == ffi::ora_gpio_use_t_ORA_GPIO_USE_FREE as u8
+    };
+    let (_, x_gpios) = board
+        .x_pin_map()
+        .get(rig.chips.len() - 1)
+        .ok_or_else(|| format!("{} has no X pin past the slot's chips", board.name()))?;
+    let select_gpio = *x_gpios
+        .iter()
+        .find(|&&g| free(g))
+        .ok_or("the X pin past the slot's chips is in use")?;
+    let rw_gpio = (0..64u8)
+        .find(|&g| {
+            let (result, info) = emu.gpio_query(g);
+            result.is_ok()
+                && info.gpio_use == ffi::ora_gpio_use_t_ORA_GPIO_USE_INPUT_FORCED as u8
+        })
+        .ok_or("the slot forces no GPIO to carry R/W")?;
+    Ok(AuxPortRig {
+        select_gpio,
+        select_mask: mask_of(x_gpios.iter().copied()),
+        rw_gpio,
+    })
+}
+
+/// One access to the aux port at `addr`: a read, returning whether One ROM
+/// drove every data line and the byte on them, or a write of `write`,
+/// returning whether One ROM kept off the data lines.
+fn aux_access(
+    emu: &Emulator,
+    rig: &MultiRig,
+    port: &AuxPortRig,
+    addr: usize,
+    write: Option<u8>,
+) -> (bool, u8) {
+    let chip = &rig.chips[0];
+    let data = &chip.cache.data_gpios[..8];
+    let data_mask = mask_of(data.iter().copied());
+    let rw = 1u64 << port.rw_gpio;
+    let rw_level = if write.is_some() { 0 } else { rw };
+    // Chip0 and the other chips deselected, the access's address and R/W.
+    let quiet = driver::merge(
+        driver::merge(
+            driver::addr_mask(addr, &chip.cache.addr_gpios),
+            driver::ctrl_mask(&chip.cache.control_lines, false),
+        ),
+        driver::merge(chip.background, (rw, rw_level)),
+    );
+    let off = driver::merge(quiet, (port.select_mask, port.select_mask));
+    let on = driver::merge(quiet, (port.select_mask, 0));
+
+    emu.drive_gpios(off.0, off.1);
+    emu.step_cycles(timing::CYCLES_AFTER_READ);
+    emu.drive_gpios(on.0, on.1);
+    emu.step_cycles(CAPTURE_ACTIVE_CYCLES);
+    let result = match write {
+        None => {
+            let pins = emu.read_pin_states();
+            let driven = emu.read_driven_pins() & data_mask == data_mask;
+            (driven, driver::extract_byte(pins, data))
+        }
+        Some(byte) => {
+            // One ROM must be off the bus before the CPU puts its byte there.
+            let kept_off = emu.read_driven_pins() & data_mask == 0;
+            let levels = data
+                .iter()
+                .enumerate()
+                .filter(|(bit, _)| byte >> bit & 1 == 1)
+                .fold(0u64, |m, (_, &g)| m | (1u64 << g));
+            let on_data = driver::merge(on, (data_mask, levels));
+            emu.drive_gpios(on_data.0, on_data.1);
+            emu.step_cycles(CAPTURE_ACTIVE_CYCLES);
+            // The CPU takes its byte off the bus a moment before the select
+            // goes, as a 6809's does past E: something else is there by then.
+            let gone = driver::merge(on, (data_mask, !levels & data_mask));
+            emu.drive_gpios(gone.0, gone.1);
+            emu.step_cycles(AUX_DATA_GONE_CYCLES);
+            emu.drive_gpios(off.0, off.1);
+            emu.step_cycles(timing::CYCLES_AFTER_READ);
+            (kept_off, byte)
+        }
+    };
+    // Long enough for the capture to land: its loop may be partway through
+    // AUX_PORT_SAMPLE_DELAY's wait when the select goes.
+    emu.drive_gpios(off.0, off.1);
+    emu.step_cycles(CAPTURE_ACTIVE_CYCLES);
+    result
+}
+
+/// The aux port: its refusals, then a CoCo-style session on it.
+///
+/// - Every chip still serves, with R/W high and low, so releasing the forced
+///   R/W GPIO left serving alone and later chip writes land on both levels.
+/// - A read of the port is answered with the byte written for that address,
+///   and a write never sees One ROM on the bus.
+/// - Every access comes out of the capture in order, with its address, data
+///   and direction, and the capture's limit is where the API says it is.
+///
+/// Runs after the address monitor has started, so the two are shown to run
+/// together.  Starts the port, which only a reboot stops, so last.
+pub fn test_aux_port(
+    emu: &Emulator,
+    rig: &MultiRig,
+    port: &AuxPortRig,
+    slot: u8,
+) -> Result<(), String> {
+    let mut errors = Vec::new();
+    let chip0 = &rig.chips[0];
+    let size0 = chip0.image.len();
+    let addr_gpio = chip0.cache.addr_gpios[0][0];
+
+    note(&mut errors, "read before start", emu.read_aux_port().0, OraResult::Error);
+    note(&mut errors, "read into NULL", emu.read_aux_port_null(), OraResult::InvalidArg);
+    for (select, rw, flags, want, what) in [
+        (port.select_gpio, port.rw_gpio, 1u32, OraResult::InvalidArg, "flags 1"),
+        (port.select_gpio, port.select_gpio, 0, OraResult::InvalidArg, "select as R/W"),
+        (64, port.rw_gpio, 0, OraResult::InvalidArg, "GPIO 64"),
+        (addr_gpio, port.rw_gpio, 0, OraResult::GpioInUse, "an address line as select"),
+        (port.select_gpio, addr_gpio, 0, OraResult::GpioInUse, "an address line as R/W"),
+    ] {
+        note(&mut errors, what, emu.start_aux_port(select, rw, flags), want);
+    }
+    note(
+        &mut errors,
+        "write past chip0's end",
+        emu.write_aux_port(size0 as u32, 0),
+        OraResult::InvalidArg,
+    );
+    if !errors.is_empty() {
+        return verdict(errors);
+    }
+
+    // The select idles inactive from here, as a wired CoCo holds it.
+    emu.drive_gpios(port.select_mask, port.select_mask);
+    let result = emu.start_aux_port(port.select_gpio, port.rw_gpio, 0);
+    if result != OraResult::Ok {
+        return Err(format!("start got {result:?}"));
+    }
+    note(
+        &mut errors,
+        "a second start",
+        emu.start_aux_port(port.select_gpio, port.rw_gpio, 0),
+        OraResult::Error,
+    );
+    note(&mut errors, "read with nothing captured", emu.read_aux_port().0, OraResult::NotReady);
+
+    // A chip byte written after the release lands on both R/W levels.
+    let (old, new) = (chip0.image[0], !chip0.image[0]);
+    let mut expected = chip0.image.clone();
+    expected[0] = new;
+    let result = emu.reprogram_ram_rom_slot_chip(slot, 0, 0, &[new], true);
+    note(&mut errors, "reprogram chip0 byte 0", result, OraResult::Ok);
+    let rw = 1u64 << port.rw_gpio;
+    for (k, chip) in rig.chips.iter().enumerate() {
+        let image = if k == 0 { &expected } else { &chip.image };
+        for level in [rw, 0] {
+            let extra = (rw | port.select_mask, level | port.select_mask);
+            if let Err(e) = verify_serving_with(emu, rig, k, image, extra) {
+                errors.push(format!("with R/W {}: {e}", if level == 0 { "low" } else { "high" }));
+            }
+        }
+    }
+    let _ = emu.reprogram_ram_rom_slot_chip(slot, 0, 0, &[old], true);
+
+    // A session: two registers written, read back, a byte written to one.
+    let (status, data) = (0x3F41usize % size0, 0x3F42usize % size0);
+    note(&mut errors, "write status", emu.write_aux_port(status as u32, 0x02), OraResult::Ok);
+    note(&mut errors, "write data", emu.write_aux_port(data as u32, 0xA5), OraResult::Ok);
+    let mut want = Vec::new();
+    for (addr, write, byte) in [(status, None, 0x02u8), (data, None, 0xA5), (data, Some(0x3C), 0x3C)] {
+        let (ok, got) = aux_access(emu, rig, port, addr, write);
+        match write {
+            None if !ok || got != byte => errors.push(format!(
+                "read of 0x{addr:04X}: driven {ok}, 0x{got:02X}, want 0x{byte:02X}"
+            )),
+            Some(_) if !ok => errors.push(format!("One ROM drove the bus on a write of 0x{addr:04X}")),
+            _ => {}
+        }
+        want.push((addr as u32, byte, write.is_some() as u8));
+    }
+    // A read's data isn't checked: epio's IN reads only what is driven from
+    // outside, where a device's pad reads back the byte One ROM drives.
+    for (i, &(addr, byte, is_write)) in want.iter().enumerate() {
+        match emu.read_aux_port() {
+            (OraResult::Ok, Some(a))
+                if (a.addr, a.is_write) == (addr, is_write)
+                    && (is_write == 0 || a.data == byte) => {}
+            (result, a) => errors.push(format!(
+                "access {i}: got {result:?} {a:?}, want 0x{addr:04X} 0x{byte:02X} write {is_write}"
+            )),
+        }
+    }
+    note(&mut errors, "read after the session", emu.read_aux_port().0, OraResult::NotReady);
+
+    // A register set by storing its byte's physical form to its entries, as a
+    // plugin does where the write call is too slow, is answered the same.
+    let (result, n, entries) = emu.get_aux_port_entries(data as u32, 8);
+    note(&mut errors, "entries of the data register", result, OraResult::Ok);
+    let (r, _, _) = emu.get_aux_port_entries(data as u32, n.saturating_sub(1));
+    note(&mut errors, "entries with room for one too few", r, OraResult::InvalidSize);
+    let (r, _, _) = emu.get_aux_port_entries(size0 as u32, 8);
+    note(&mut errors, "entries past chip0's end", r, OraResult::InvalidArg);
+    let phys = emu.map_data_to_phys(0x5A);
+    for &entry in &entries {
+        // SAFETY: the firmware returned it as one of the served table's
+        // entries, which live in epio's SRAM buffer.
+        unsafe { *entry = phys };
+    }
+    let (ok, got) = aux_access(emu, rig, port, data, None);
+    if !ok || got != 0x5A {
+        errors.push(format!(
+            "read of a register set through its {n} entries: driven {ok}, 0x{got:02X}, want 0x5A"
+        ));
+    }
+    note(&mut errors, "that read's capture", emu.read_aux_port().0, OraResult::Ok);
+
+    // Four in the FIFO and one held in the state machine; the sixth is lost.
+    for i in 0..6u8 {
+        aux_access(emu, rig, port, data, Some(i));
+    }
+    for i in 0..5u8 {
+        // Room in the FIFO lets the held one in, given cycles to run.
+        emu.step_cycles(timing::CYCLES_AFTER_READ);
+        match emu.read_aux_port() {
+            (OraResult::Ok, Some(a)) if a.data == i && a.is_write == 1 => {}
+            (result, a) => errors.push(format!("held write {i}: got {result:?} {a:?}")),
+        }
+    }
+    note(&mut errors, "the write past the limit", emu.read_aux_port().0, OraResult::NotReady);
+
+    if errors.is_empty() {
+        println!(
+            "  select GPIO {}, R/W GPIO {}: reads answered, writes captured",
+            port.select_gpio, port.rw_gpio
+        );
+    }
     verdict(errors)
 }

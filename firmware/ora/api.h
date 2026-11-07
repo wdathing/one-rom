@@ -849,6 +849,36 @@ typedef enum {
      */
     ORA_ID_LOCAL_COPY_FLASH_CHIP_TO_RAM_CHIP = 0x00010005,
 
+    /**
+     * @brief Start answering reads, and capturing accesses, on an extra
+     *        select line
+     * @sa ora_start_aux_port_fn_t
+     * @since firmware 0.8.0, local extension
+     */
+    ORA_ID_LOCAL_START_AUX_PORT              = 0x00010006,
+
+    /**
+     * @brief Take the next access the aux port captured
+     * @sa ora_read_aux_port_fn_t
+     * @since firmware 0.8.0, local extension
+     */
+    ORA_ID_LOCAL_READ_AUX_PORT               = 0x00010007,
+
+    /**
+     * @brief Set the byte the aux port answers a read of an address with
+     * @sa ora_write_aux_port_fn_t
+     * @since firmware 0.8.0, local extension
+     */
+    ORA_ID_LOCAL_WRITE_AUX_PORT              = 0x00010008,
+
+    /**
+     * @brief Find where the aux port keeps the byte for an address, to set it
+     *        directly
+     * @sa ora_get_aux_port_entries_fn_t
+     * @since firmware 0.8.0, local extension
+     */
+    ORA_ID_LOCAL_GET_AUX_PORT_ENTRIES        = 0x00010009,
+
     /** Invalid API identifier */
     ORA_ID_INVALID = 0xFFFFFFFF,
 } api_id_t;
@@ -3613,6 +3643,152 @@ typedef ora_result_t (*ora_copy_flash_chip_to_ram_chip_fn_t)(
     uint8_t ram_slot,
     uint8_t dst_chip,
     uint8_t allow_active
+);
+
+/**
+ * @brief Start answering reads, and capturing accesses, on an extra select
+ *        line
+ * @sa ORA_ID_LOCAL_START_AUX_PORT
+ * @since firmware 0.8.0, local extension
+ *
+ * The aux port is a select line wired to a GPIO the served slot doesn't use,
+ * such as a CoCo's SCS* on an X pin of a two chip multi-ROM slot, and a
+ * read/write line wired to a GPIO the slot leaves unused or forces, such as
+ * the socket's OE pin where the slot ignores OE.
+ *
+ * - While the select is active and the read/write line is high, One ROM drives
+ *   the data bus.  It never drives it while the line is low.
+ * - The byte it drives for an address is the one the served slot's table holds
+ *   for that address with no chip selected, which nothing else serves.  Set it
+ *   with @ref ora_write_aux_port_fn_t.
+ * - Every access, read or write, is captured as the select goes inactive,
+ *   with the data bus as it was some 60ns before - for a write, the byte
+ *   written, which a CPU may already have taken off the bus by the time its
+ *   select goes.  Take them with @ref ora_read_aux_port_fn_t.
+ *
+ * Neither line need otherwise be free.  A forced input is released, so the
+ * port reads the real line.  The served slot's table already holds every byte
+ * for both levels of a forced GPIO, so serving is unchanged, and from then on
+ * every write to the slot, through this API or any other, lands on both.
+ *
+ * Supported for a multi-ROM slot only, and once per boot.  The port takes a
+ * state machine in each of the two serving PIO blocks, after the address
+ * monitor's, so the two can run together.
+ *
+ * @param select_gpio  GPIO of the select line, active low.  Must be unused by
+ *                     the served slot, or a forced input.
+ * @param rw_gpio      GPIO of the read/write line, high for a read.  Must be
+ *                     unused by the served slot, or a forced input.
+ * @param flags        Reserved, 0.
+ * @return ORA_RESULT_OK on success.
+ *         ORA_RESULT_NOT_SUPPORTED if the served slot isn't multi-ROM, or the
+ *         port's state machines don't fit beside serving.
+ *         ORA_RESULT_GPIO_IN_USE if either GPIO is one serving uses.
+ *         ORA_RESULT_INVALID_ARG if the two GPIOs are the same, either is out
+ *         of range or out of the serving blocks' reach, or @p flags isn't
+ *         0.
+ *         ORA_RESULT_ERROR if the port is already running.
+ */
+typedef ora_result_t (*ora_start_aux_port_fn_t)(
+    uint8_t select_gpio,
+    uint8_t rw_gpio,
+    uint32_t flags
+);
+
+/**
+ * @brief An access the aux port captured
+ * @since firmware 0.8.0, local extension
+ */
+typedef struct {
+    /**
+     * @brief The address, as the served slot's first chip reads its address
+     *        lines
+     */
+    uint32_t addr;
+    /** @brief The data bus, as a logical byte */
+    uint8_t data;
+    /** @brief 1 for a write, 0 for a read */
+    uint8_t is_write;
+    /** @brief Reserved, 0 */
+    uint8_t reserved[2];
+} ora_aux_port_access_t;
+_Static_assert(sizeof(ora_aux_port_access_t) == 8, "ora_aux_port_access_t must be 8 bytes");
+
+/**
+ * @brief Take the next access the aux port captured
+ * @sa ORA_ID_LOCAL_READ_AUX_PORT
+ * @since firmware 0.8.0, local extension
+ *
+ * Accesses come out in the order they happened.  The port holds five: four
+ * queued, and one waiting to join them.  Past that it stops capturing, and
+ * accesses are lost until one is taken, so a caller needing every write must
+ * keep up: at a CoCo's pace, one every 20us or so, that is within about 80us.
+ *
+ * @param access_out  Receives the access.
+ * @return ORA_RESULT_OK on success.
+ *         ORA_RESULT_NOT_READY if none is waiting.
+ *         ORA_RESULT_INVALID_ARG if @p access_out is NULL.
+ *         ORA_RESULT_ERROR if the port isn't running.
+ */
+typedef ora_result_t (*ora_read_aux_port_fn_t)(
+    ora_aux_port_access_t *access_out
+);
+
+/**
+ * @brief Set the byte the aux port answers a read of an address with
+ * @sa ORA_ID_LOCAL_WRITE_AUX_PORT
+ * @since firmware 0.8.0, local extension
+ *
+ * Writes the served slot's table entry for @p addr with no chip selected,
+ * everywhere a read of it can land.  The port answers the next read of @p addr
+ * with @p data.  @p addr is as @ref ora_aux_port_access_t reports it.
+ *
+ * @param addr  Address, within the served slot's first chip.
+ * @param data  Logical byte.
+ * @return ORA_RESULT_OK on success.
+ *         ORA_RESULT_INVALID_ARG if @p addr is beyond the first chip.
+ *         ORA_RESULT_NOT_SUPPORTED if the served slot isn't multi-ROM.
+ *         ORA_RESULT_NO_SLOT_ACTIVE if no RAM slot is being served.
+ */
+typedef ora_result_t (*ora_write_aux_port_fn_t)(
+    uint32_t addr,
+    uint8_t data
+);
+
+/**
+ * @brief Find where the aux port keeps the byte for an address, to set it
+ *        directly
+ * @sa ORA_ID_LOCAL_GET_AUX_PORT_ENTRIES
+ * @since firmware 0.8.0, local extension
+ *
+ * @ref ora_write_aux_port_fn_t works out where the byte goes on every call,
+ * which takes tens of microseconds.  A port register a CPU polls - a Becker
+ * port's status, re-read 20us after each byte is taken - must change faster
+ * than that.  This works it out once: storing the byte's physical form, from
+ * @ref ora_map_data_to_phys_fn_t, to every entry returned has the same effect
+ * as @ref ora_write_aux_port_fn_t.
+ *
+ * The entries hold until the served RAM slot changes.
+ *
+ * @param addr         Address, within the served slot's first chip, as for
+ *                     @ref ora_write_aux_port_fn_t.
+ * @param entries_out  Receives up to @p max entry addresses.
+ * @param max          Room in @p entries_out.
+ * @param count_out    Receives how many entries the byte has, whether or not
+ *                     all fit.
+ * @return ORA_RESULT_OK on success.
+ *         ORA_RESULT_INVALID_SIZE if more than @p max entries hold the byte;
+ *         @p count_out says how many.
+ *         ORA_RESULT_INVALID_ARG if @p addr is beyond the first chip, or an
+ *         output pointer is NULL.
+ *         ORA_RESULT_NOT_SUPPORTED if the served slot isn't multi-ROM.
+ *         ORA_RESULT_NO_SLOT_ACTIVE if no RAM slot is being served.
+ */
+typedef ora_result_t (*ora_get_aux_port_entries_fn_t)(
+    uint32_t addr,
+    uint8_t **entries_out,
+    uint8_t max,
+    uint8_t *count_out
 );
 
 /** @} */ // plugin_api_functions

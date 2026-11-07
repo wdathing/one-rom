@@ -275,6 +275,11 @@ fn main() {
         .allowlist_function("epio_get_gpio_force_input_low")
         .allowlist_function("epio_get_gpio_force_input_high")
         .allowlist_function("set_host_sram_ptr")
+        // The aux port's capture FIFO, which the firmware pops through a seam
+        // under emulation, and epio's FIFO the harness pops it from.
+        .allowlist_function("set_host_aux_port_rx_pop")
+        .allowlist_function("epio_pop_rx_fifo")
+        .allowlist_function("epio_rx_fifo_depth")
         .allowlist_function("stub_set_sel_image")
         .allowlist_function("stub_set_rp_variant")
         .allowlist_function("stub_bootloader_entered")

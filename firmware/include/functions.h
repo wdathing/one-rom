@@ -237,6 +237,23 @@ ora_result_t pio_set_x_pin_enabled(
     uint8_t enabled
 );
 ora_result_t pio_start_address_monitor(void);
+ora_result_t pio_start_aux_port(
+    const onerom_rom_slot_t *slot,
+    uint8_t select_gpio,
+    uint8_t rw_gpio,
+    uint32_t flags
+);
+ora_result_t pio_read_aux_port(
+    const onerom_rom_slot_t *slot,
+    ora_aux_port_access_t *access_out
+);
+ora_result_t pio_write_aux_port(uint32_t addr, uint8_t data);
+ora_result_t pio_get_aux_port_entries(
+    uint32_t addr,
+    uint8_t **entries_out,
+    uint8_t max,
+    uint8_t *count_out
+);
 volatile uint32_t * volatile *pio_get_address_monitor_ring_write_pos(void);
 ora_result_t pio_get_new_rom_ram_region(uint32_t *addr_out, uint32_t *size_out);
 uint8_t pio_get_effective_addr_pins(void);
@@ -272,6 +289,7 @@ void irq_handler_timer0_irq_0(void);
 // TIMER0 alarm 1, which the LED engine owns.  Alarm 0 is left to plugins.
 void irq_handler_timer0_irq_1(void);
 void irq_handler_usbctrl_irq(void);
+uint8_t ora_get_ram_slot_count(void);
 ora_result_t ora_get_ram_slot_info(uint8_t ram_slot, uint32_t *addr_out, uint32_t *size_out, uint32_t *rom_type_out);
 ora_result_t ora_get_active_ram_slot(uint8_t *ram_slot_out);
 uint32_t ora_get_clkref_mhz(void);
@@ -310,6 +328,11 @@ void set_host_monitor_dma_configure(monitor_dma_configure_fn_t fn);
 // Sets the slot the firmware reads the address-monitor ring write position
 // from; point it at epio's live capture write pointer.
 void set_host_monitor_write_slot(volatile uint32_t * volatile *slot);
+
+// Aux port emulation seam (see pioplugin.c).  Pops an SM's RX FIFO into *out,
+// returning 0 if it was empty; the harness wires it to epio's.
+typedef uint8_t (*aux_port_rx_pop_fn_t)(uint8_t block, uint8_t sm, uint32_t *out);
+void set_host_aux_port_rx_pop(aux_port_rx_pop_fn_t fn);
 
 // Generic test-yield hook.  The harness installs a callback here, which the
 // firmware invokes at points where it would otherwise busy-wait on hardware

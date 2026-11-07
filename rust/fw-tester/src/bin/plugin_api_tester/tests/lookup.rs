@@ -244,6 +244,22 @@ pub fn test_lookup_coverage(emu: &Emulator, base_dir: &Path) -> Result<(), Strin
             ffi::api_id_t_ORA_ID_LOCAL_COPY_FLASH_CHIP_TO_RAM_CHIP,
             "ORA_ID_LOCAL_COPY_FLASH_CHIP_TO_RAM_CHIP",
         ),
+        (
+            ffi::api_id_t_ORA_ID_LOCAL_START_AUX_PORT,
+            "ORA_ID_LOCAL_START_AUX_PORT",
+        ),
+        (
+            ffi::api_id_t_ORA_ID_LOCAL_READ_AUX_PORT,
+            "ORA_ID_LOCAL_READ_AUX_PORT",
+        ),
+        (
+            ffi::api_id_t_ORA_ID_LOCAL_WRITE_AUX_PORT,
+            "ORA_ID_LOCAL_WRITE_AUX_PORT",
+        ),
+        (
+            ffi::api_id_t_ORA_ID_LOCAL_GET_AUX_PORT_ENTRIES,
+            "ORA_ID_LOCAL_GET_AUX_PORT_ENTRIES",
+        ),
     ];
 
     // Deprecated/invalid IDs — must resolve to null.
