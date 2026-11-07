@@ -1,5 +1,9 @@
 # Changelog
 
+## [1.4.0] - 2026-11-07
+
+- Loads coco-grub boot menu entries: from the CoCo 2 motherboard socket, it copies the chosen entry's ROMs into the live slot and turns the cartridge select on or off. Needs the coco-grub fork firmware's local plugin API.
+
 ## [1.3.1] - 2026-10-29
 
 - A noisy link to the ESP32 now makes HDB-DOS reread sectors instead of crashing the CoCo. Stray bytes no longer shift the next sector by a byte.
