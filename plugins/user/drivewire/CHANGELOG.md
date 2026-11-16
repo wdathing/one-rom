@@ -3,6 +3,8 @@
 ## [Unreleased]
 
 - Serves DOSplus 5 on a Dragon, through the DW42 extender's onerom build. Each read now puts the ROM's own bytes back in the reply window at $E000, where that image has code.
+- coco-grub entries can ask for a Becker port, which the plugin bridges to UART1, so a stock Becker HDB-DOS reaches FujiNet without the cartridge.
+- Fixes coco-grub entries sometimes stopping at "LOAD FAILED - POWER CYCLE", when the plugin missed some of the menu's signals.
 
 ## [1.4.0] - 2026-11-07
 

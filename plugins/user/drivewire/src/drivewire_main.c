@@ -63,7 +63,7 @@
 // Plugin header
 // ---------------------------------------------------------------------------
 
-void drivewire_main(
+void drivewire_entry(
     ora_lookup_fn_t ora_lookup_fn,
     ora_plugin_type_t plugin_type,
     const ora_entry_args_t *entry_args
@@ -76,7 +76,7 @@ const ora_plugin_header_t ora_plugin_header = {
     .minor_version = MINOR_VERSION,
     .patch_version = PATCH_VERSION,
     .build_version = BUILD_VERSION,
-    .entry         = drivewire_main,
+    .entry         = drivewire_entry,
     .plugin_type   = ORA_PLUGIN_TYPE_USER,
     .sam_usage     = 255,
     .overrides1    = 0,
@@ -123,7 +123,7 @@ static const uint8_t s_knock_read[KNOCK_LEN]  = {'!','D','W','R','E','C','V','!'
 // DriveWire proper - a One-ROM-specific extension the config app's own
 // knock-sending code (not fujinet-lib, not hdbdos) speaks directly.
 static const uint8_t s_knock_cart[KNOCK_LEN]  = {'!','L','D','C','A','R','T','!'};  // "!LDCART!"
-// CoCo -> plugin: load a boot menu entry - see drivewire_do_grub().  Only
+// CoCo -> plugin: load a boot menu entry - see drivewire_grub_payload().  Only
 // matched in a multi-ROM slot, and the others only outside one.
 static const uint8_t s_knock_grub[KNOCK_LEN]  = {'!','G','R','U','B','G','O','!'};  // "!GRUBGO!"
 
@@ -551,7 +551,7 @@ enum {
     DW_ERR_READ_SHORT,         // arg: reply bytes received - see DW_REPLY_GAP_MS
     DW_ERR_STALE_RX,           // arg: bytes discarded - see drivewire_discard_stale()
     DW_ERR_GRUB,               // arg: (step << 8) | ora_result_t, step 1 chip 1, 2 X1, 3 chip 0; 0x100 alone, a bad check byte
-                               // - see drivewire_do_grub()
+                               // - see drivewire_grub_payload() and drivewire_grub_load()
     DW_ERR_BECKER,             // arg: 0x100 SCS* not idling high, 0x200 | the port start's ora_result_t,
                                // 0x300 a reply byte lost to a full queue, 0x400 | the entries lookup's
                                // ora_result_t - see drivewire_becker_main()
@@ -2283,14 +2283,18 @@ __attribute__((noinline)) static void drivewire_resolve_cart_window(ora_lookup_f
 // which the SAM maps to the top of the socket - about one capture a
 // microsecond while the CoCo runs from ROM.  A firmware demangle of each one
 // falls behind that, and the 64-entry ring laps.  So each capture is tested
-// against the signal page's raw pattern first, a mask and a compare, and only
-// a signal is demangled.  Anything else is skipped outright: the knock is the
-// next eight signals, whatever comes between them.
+// against the signal page's raw pattern first, a mask and a compare, and
+// anything else is skipped outright: the knock is the next eight signals,
+// whatever comes between them.  A signal's byte is read from its raw bits too,
+// by grub_filter_t's table.  A firmware demangle of each signal still fell
+// behind the menu's burst of twelve, which lost the payload's last few.
 #define GRUB_SIGNAL_PAGE 0x3C00u   // chip 0 offset of $BC00
 
 typedef struct {
     uint32_t mask;   // raw capture bits naming the page: A8-A13, and the selects
     uint32_t match;  // those bits in a capture of the signal page
+    uint32_t base;   // the raw pattern of address 0
+    uint32_t bit[8]; // the raw bit(s) each of A0-A7 flips from base
 } grub_filter_t;
 
 // The raw pattern of the signal page, from the firmware's own mapping, so it
@@ -2306,6 +2310,10 @@ static void drivewire_grub_filter(ora_lookup_fn_t ora_lookup_fn, grub_filter_t *
     }
     f->mask  = mask;
     f->match = map(GRUB_SIGNAL_PAGE) & mask;
+    f->base  = base;
+    for (unsigned n = 0; n < 8u; n++) {
+        f->bit[n] = map(1u << n) ^ base;
+    }
 }
 
 // The next byte the menu signals.  Waits as long as it takes.
@@ -2320,28 +2328,47 @@ __attribute__((always_inline)) static inline uint8_t drivewire_grub_byte(const g
         if ((phys & f->mask) != f->match) {
             continue;
         }
-        uint32_t addr;
-        if (s_demangle(phys, &addr, 1) == ORA_RESULT_OK) {
-            return (uint8_t)(addr & 0xFFu);
+        uint32_t flipped = phys ^ f->base;
+        uint8_t b = 0;
+        for (unsigned n = 0; n < 8u; n++) {
+            if (flipped & f->bit[n]) {
+                b |= (uint8_t)(1u << n);
+            }
         }
+        return b;
     }
 }
 
-// Loads the coco-grub boot menu entry a "!GRUBGO!" knock names into the
-// served slot.  Four signalled bytes follow the knock - see
-// drivewire_grub_byte():
-//
-//   the flash slot (plugins excluded) of the ROM for chip 0, the socket;
-//   the flash slot of the ROM for chip 1, on the cartridge select, or 0xFF;
-//   flags - bit 0 answers the cartridge select, bit 2 a Becker port on SCS*;
-//   a check byte, the other three summed and XORed with 0x5A.
-//
-// The menu is running from the CoCo's own RAM by then, polling the reset
-// vector at $BFFE until it reads the entry's.  Chip 0 goes last, written in
-// ascending order, so the vector is the last thing to land: once the menu sees
-// it, the whole entry is in place.  Returns, for the caller to wait for the
-// next knock, only where the entry wasn't loaded; the menu times out and says
-// so.
+// The plugin's stack top, entry_args->stack_top - see DRIVEWIRE_STACK_JUMP().
+static uint32_t s_stack_top;
+
+// Jumps to fn, a function that never returns, with the stack reset to its top
+// and arg as its one argument.  Every frame below is dead by then: the plugin
+// never returns into anything, so each stage can start with the whole stack
+// rather than what the one before left - see drivewire_entry() and
+// drivewire_grub_load().  r0 is a clobber so that neither operand lands in it.
+#define DRIVEWIRE_STACK_JUMP(fn, arg)                                      \
+    do {                                                                   \
+        __asm__ volatile (                                                 \
+            "mov r0, %2\n"                                                 \
+            "mov sp, %0\n"                                                 \
+            "bx  %1\n"                                                     \
+            :                                                              \
+            : "r"(s_stack_top), "r"(fn), "r"((uint32_t)(arg))              \
+            : "r0", "memory"                                               \
+        );                                                                 \
+        __builtin_unreachable();                                           \
+    } while (0)
+
+__attribute__((noinline, noreturn)) static void drivewire_grub_main(void);
+
+// Loads the entry payload names, entered by DRIVEWIRE_STACK_JUMP() with the
+// whole stack.  The firmware calls below go deep - an entry with a Becker port
+// reaches 244 bytes below the top - and beneath drivewire_grub_main()'s frames,
+// themselves 140 bytes deep, they wouldn't fit.  payload is the knock's first
+// three bytes, b0 | b1 << 8 | b2 << 16 - see drivewire_grub_payload().  Goes
+// back to waiting for a knock, with the whole stack again, where the entry
+// wasn't loaded; the menu times out and says so.
 //
 // A Becker port starts ahead of the copies: starting it doubles the table
 // entries for R/W's two levels, which the copies then write both of.  The
@@ -2351,37 +2378,32 @@ __attribute__((always_inline)) static inline uint8_t drivewire_grub_byte(const g
 __attribute__((noinline)) static bool drivewire_becker_start(void);
 __attribute__((noinline, noreturn)) static void drivewire_becker_main(void);
 
-__attribute__((noinline)) static void drivewire_do_grub(const grub_filter_t *f) {
-    uint8_t b[4];
-    for (unsigned i = 0; i < 4u; i++) {
-        b[i] = drivewire_grub_byte(f);
-    }
-    if ((uint8_t)((b[0] + b[1] + b[2]) ^ 0x5Au) != b[3]) {
-        drivewire_error(DW_ERR_GRUB, 0x100u);
-        return;
-    }
+__attribute__((noinline, noreturn)) static void drivewire_grub_load(uint32_t payload) {
+    uint8_t socket = (uint8_t)payload;
+    uint8_t cart   = (uint8_t)(payload >> 8);
+    uint8_t flags  = (uint8_t)(payload >> 16);
 
     ora_result_t rc;
-    bool becker = (b[2] & 0x04u) != 0u && drivewire_becker_start();
-    bool chip1 = (b[1] != 0xFFu);
+    bool becker = (flags & 0x04u) != 0u && drivewire_becker_start();
+    bool chip1 = (cart != 0xFFu);
     if (chip1) {
-        rc = s_copy_flash_chip(b[1], ORA_FLASH_SLOT_FLAG_EXCLUDE_PLUGINS, 0u,
+        rc = s_copy_flash_chip(cart, ORA_FLASH_SLOT_FLAG_EXCLUDE_PLUGINS, 0u,
                                s_active_slot, 1u, 1u);
         if (rc != ORA_RESULT_OK) {
             drivewire_error(DW_ERR_GRUB, (uint16_t)(0x100u | rc));
-            return;
+            DRIVEWIRE_STACK_JUMP(drivewire_grub_main, 0u);
         }
     }
-    rc = s_set_x_pin_enabled(1u, (chip1 && (b[2] & 0x01u)) ? 1u : 0u);
+    rc = s_set_x_pin_enabled(1u, (chip1 && (flags & 0x01u)) ? 1u : 0u);
     if (rc != ORA_RESULT_OK) {
         drivewire_error(DW_ERR_GRUB, (uint16_t)(0x200u | rc));
-        return;
+        DRIVEWIRE_STACK_JUMP(drivewire_grub_main, 0u);
     }
-    rc = s_copy_flash_chip(b[0], ORA_FLASH_SLOT_FLAG_EXCLUDE_PLUGINS, 0u,
+    rc = s_copy_flash_chip(socket, ORA_FLASH_SLOT_FLAG_EXCLUDE_PLUGINS, 0u,
                            s_active_slot, 0u, 1u);
     if (rc != ORA_RESULT_OK) {
         drivewire_error(DW_ERR_GRUB, (uint16_t)(0x300u | rc));
-        return;
+        DRIVEWIRE_STACK_JUMP(drivewire_grub_main, 0u);
     }
 
     if (becker) {
@@ -2394,6 +2416,34 @@ __attribute__((noinline)) static void drivewire_do_grub(const grub_filter_t *f) 
     for (;;) {
         ORA_TEST_YIELD();
     }
+}
+
+// Takes the four bytes the menu signals after a "!GRUBGO!" knock - see
+// drivewire_grub_byte():
+//
+//   the flash slot (plugins excluded) of the ROM for chip 0, the socket;
+//   the flash slot of the ROM for chip 1, on the cartridge select, or 0xFF;
+//   flags - bit 0 answers the cartridge select, bit 2 a Becker port on SCS*;
+//   a check byte, the other three summed and XORed with 0x5A.
+//
+// and loads the entry they name, never to return, or records a bad check
+// byte and returns for the caller to wait for the next knock.
+//
+// The menu is running from the CoCo's own RAM by then, polling the reset
+// vector at $BFFE until it reads the entry's.  Chip 0 goes last, written in
+// ascending order, so the vector is the last thing to land: once the menu sees
+// it, the whole entry is in place.
+__attribute__((noinline)) static void drivewire_grub_payload(const grub_filter_t *f) {
+    uint8_t b[4];
+    for (unsigned i = 0; i < 4u; i++) {
+        b[i] = drivewire_grub_byte(f);
+    }
+    if ((uint8_t)((b[0] + b[1] + b[2]) ^ 0x5Au) != b[3]) {
+        drivewire_error(DW_ERR_GRUB, 0x100u);
+        return;
+    }
+    DRIVEWIRE_STACK_JUMP(drivewire_grub_load,
+                        (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16));
 }
 
 // Starts the Becker port, or records why it can't and returns false.
@@ -2549,7 +2599,7 @@ __attribute__((noinline, noreturn)) static void drivewire_becker_main(void) {
 
 // The plugin's whole life in grub mode - see s_grub_mode: wait for the boot
 // menu's knock and load the entry it names.  Never returns, and entered with
-// the stack reset to its top - see drivewire_main().  A loop of its own rather
+// the stack reset to its top - see DRIVEWIRE_STACK_JUMP().  A loop of its own rather
 // than a fourth knock in drivewire_wait_for_knock(): that is inlined into
 // drivewire_main() along with drivewire_next_addr(), and a second caller of
 // either grew its frame.  Grub mode has no use for DriveWire's UART draining
@@ -2569,7 +2619,7 @@ __attribute__((noinline, noreturn)) static void drivewire_grub_main(void) {
             if (window[i] != s_knock_grub[i]) match = false;
         }
         if (match) {
-            drivewire_do_grub(&f);
+            drivewire_grub_payload(&f);
         }
     }
 }
@@ -2624,6 +2674,8 @@ static void drivewire_setup(ora_lookup_fn_t ora_lookup_fn) {
     // regardless of call order. Trimming that instrumentation (see the
     // deleted per-byte read-session debug vars) reopened a ~20-byte positive
     // margin, confirmed by measuring the stack pointer directly at the time.
+    // Later statics ate that margin too, and setup now runs from the stack's
+    // top instead - see drivewire_entry().
     //
     // High priority stops captures being lost under heavy ROM read traffic.
     // At normal priority the CoCo's own boot, before it speaks this protocol,
@@ -2752,16 +2804,8 @@ static void init_data_bss(void) {
 #endif // !ORA_HOST_TEST
 }
 
-void drivewire_main(
-    ora_lookup_fn_t         ora_lookup_fn,
-    ora_plugin_type_t       plugin_type,
-    const ora_entry_args_t *entry_args
-) {
-    // Before anything reads a static.
-    init_data_bss();
-
-    (void)plugin_type;
-    (void)entry_args;
+// The plugin's life, entered from drivewire_entry() with the whole stack.
+__attribute__((noinline, noreturn)) static void drivewire_main(ora_lookup_fn_t ora_lookup_fn) {
 
 #ifdef DRIVEWIRE_TEST_UART_ONLY
     // Isolates UART1 bring-up from everything else: no address monitor, no
@@ -2821,19 +2865,9 @@ void drivewire_main(
 
     drivewire_setup(ora_lookup_fn);
     if (s_grub_mode) {
-        // The user plugin runs on core 0's own stack, entered from the
-        // firmware's launch code, and never returns - so in grub mode
-        // nothing below this frame, nor this frame itself, is used again.
-        // Restart the stack from its top, giving grub mode all of it: the
-        // firmware's entry copy goes ~190 bytes deep, and what is left once
-        // DriveWire's static RAM is taken is a few hundred.
-        __asm__ volatile (
-            "mov sp, %0\n"
-            "bx  %1\n"
-            :
-            : "r"(entry_args->stack_top), "r"(drivewire_grub_main)
-        );
-        __builtin_unreachable();
+        // Grub mode never comes back here, so it starts with the whole
+        // stack again, rather than beneath this frame.
+        DRIVEWIRE_STACK_JUMP(drivewire_grub_main, 0u);
     }
 
     for (;;) {
@@ -2908,4 +2942,24 @@ void drivewire_main(
             drivewire_error(DW_ERR_READ_COUNT, count);
         }
     }
+}
+
+// The plugin's entry.  The firmware calls it on core 0's own stack, beneath
+// its launch code's frames, and the plugin never returns, so those frames are
+// dead: drivewire_main() starts again from the stack's top.  Setup goes deep -
+// pio_setup_address_monitor() alone has a 208-byte frame, and setup reaches
+// 288 bytes below the top - and run beneath the launch code's frames it went
+// past the stack's end into .bss, overwriting whichever statics were last
+// there and were set before it ran.
+void drivewire_entry(
+    ora_lookup_fn_t         ora_lookup_fn,
+    ora_plugin_type_t       plugin_type,
+    const ora_entry_args_t *entry_args
+) {
+    // Before anything reads a static.
+    init_data_bss();
+
+    (void)plugin_type;
+    s_stack_top = entry_args->stack_top;
+    DRIVEWIRE_STACK_JUMP(drivewire_main, ora_lookup_fn);
 }
