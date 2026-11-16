@@ -80,9 +80,10 @@ pair, with `PSHS` filling the buffer downwards. So the plugin writes the
 window to suit: the first *count* mod 7 bytes (which the CoCo copies singly),
 then the reply's last 7 bytes, then the 7 before those, and so on.
 
-The window is in the 27128's upper 8K, which an 8K HDB-DOS image leaves as a
-duplicate of itself or as padding, and which no code runs from. The plugin
-leaves the last reply there rather than restoring it.
+In a 16K image the window is live code: DOSplus 5's DriveWire extender
+starts at $E000. So the plugin swaps each piece of the reply with the
+window bytes it lands on, and swaps them back once the CoCo acknowledges.
+Outside a read, the window holds the image as assembled.
 
 Until the reply is ready - while the plugin waits for the ESP32, or
 receives a cartridge push that comes ahead of it - the plugin flips the

@@ -38,7 +38,7 @@
 // that safe is that the plugin reads and caches the real bytes once at
 // startup and restores them the moment each session ends, so outside an
 // active session the code is exactly what it was assembled as.  The window
-// sits in the image's unused upper 8K instead, and needs no restore - see
+// gets the same treatment, by a swap rather than a snapshot - see
 // DW_WINDOW_ADDR.  The knock sequences themselves are pure reads and never
 // touch served content at all.
 //
@@ -152,13 +152,13 @@ _Static_assert(DW_STATUS_WAIT != DW_STATUS_READY && DW_STATUS_BUSY != DW_STATUS_
 
 // Where a read session lays out its response for the CoCo to copy at full
 // bus speed - $E000 to $E0FF, 256 bytes for the largest response
-// (sizeof(s_read_buf)).  It is in the 27128's upper 8K, which the 8K HDB-DOS
-// image leaves as a duplicate of itself or as padding, depending on the
-// slot's size handling, and which no code runs from.  So unlike
-// DW_STATUS_ADDR it needs no snapshot and no restore, and the last response
-// simply stays there until the next.  The layout suits dwoneread.asm's
-// stack blast (PULU/PSHS, 7 bytes at a time, PSHS filling the buffer
-// downwards) - see drivewire_do_read().
+// (sizeof(s_read_buf)).  For the 8K HDB-DOS image that is the 27128's upper
+// 8K, a duplicate or padding, but in a 16K image it is live code: DOSplus 5's
+// DriveWire extender starts there, with the "EI" mark DOSplus looks for at
+// reset.  So the window's own bytes go back once the CoCo has the response -
+// see drivewire_window_swap().  The layout suits dwoneread.asm's stack blast
+// (PULU/PSHS, 7 bytes at a time, PSHS filling the buffer downwards) - see
+// drivewire_do_read().
 #define DW_WINDOW_ADDR    0x2000u
 #define DW_BLAST_CHUNK    7u
 
@@ -424,6 +424,18 @@ static uint8_t s_read_buf[256];
 // drivewire_do_read(), so stale bytes from one session's window can never
 // bleed into the next.
 static uint16_t s_read_buf_filled;
+
+// True from the moment drivewire_do_read() starts laying a response out until
+// the window's own bytes are back: meanwhile s_read_buf holds those bytes, not
+// a response, and drivewire_drain_rx() leaves UART1 alone so nothing lands on
+// them.  The FIFO holds anything that arrives for the millisecond or so the
+// CoCo takes to copy the window - and a byte arriving then is a stray, which
+// the next request's drivewire_discard_stale() throws away as it would have.
+static bool s_window_swapped;
+
+// drivewire_window_swap()'s staging for the window's bytes, a static so the
+// swap costs do_read's thin stack margin no more than an s_reprogram() call.
+static uint8_t s_window_tmp[DW_BLAST_CHUNK];
 
 // Set by drivewire_check_uart_rx() on a UART1 receive error, and cleared by
 // drivewire_discard_stale() as each request goes out, which checks RSR first,
@@ -953,7 +965,8 @@ static uint32_t s_pushback_addr_plus1;
 // the bytes behind its header are the push's own, left in the FIFO for
 // drivewire_receive_confirmed_push().
 __attribute__((always_inline)) static inline void drivewire_drain_rx(void) {
-    while (s_read_buf_filled < sizeof(s_read_buf) && !s_cart_push_confirmed &&
+    while (!s_window_swapped &&
+           s_read_buf_filled < sizeof(s_read_buf) && !s_cart_push_confirmed &&
            !(UART_REG(DW_UART_BASE, UART_FR_OFFSET) & UART_FR_RXFE)) {
         uint8_t b = (uint8_t)UART_REG(DW_UART_BASE, UART_DR_OFFSET);
         if (s_push_probe_enabled) {
@@ -1426,6 +1439,52 @@ static void drivewire_do_write(uint16_t count) {
     }
 }
 
+// Lays a count-byte response out in DW_WINDOW_ADDR, in pieces, for
+// dwoneread.asm's stack blast, whose PSHS fills the CoCo's buffer downwards,
+// DW_BLAST_CHUNK bytes at a time, while its PULU reads the window upwards.  So
+// the chunks go in reverse: the first count % DW_BLAST_CHUNK bytes (which the
+// CoCo copies singly, upwards), then s_read_buf's last chunk, then the one
+// before, and so on back to the head.
+//
+// Each piece is swapped with the window bytes it lands on, not just written,
+// so afterwards s_read_buf holds the window's own bytes, each where the piece
+// that displaced it came from.  The same call again swaps them back - the
+// window is the ROM it was assembled as once more, which matters wherever the
+// window is live code (see DW_WINDOW_ADDR), and s_read_buf no longer means
+// anything.  No second buffer: this plugin has no RAM for one.
+//
+// Swaps at most `pieces` pieces, stopping at the first that fails, and
+// returns how many it swapped - so a layout that fails part way is undone by
+// passing back what it returned.  DW_WINDOW_PIECES(count) is the whole layout.
+#define DW_WINDOW_PIECES(count) \
+    ((uint16_t)((count) / DW_BLAST_CHUNK + ((count) % DW_BLAST_CHUNK != 0u)))
+static uint16_t drivewire_window_swap(uint16_t count, uint16_t pieces) {
+    uint16_t head = count % DW_BLAST_CHUNK;
+    uint16_t end = count;  // where the next chunk ends in s_read_buf
+    uint32_t dst = DW_WINDOW_ADDR;
+    uint16_t done = 0u;
+    for (; done < pieces && dst < DW_WINDOW_ADDR + count; done++) {
+        uint16_t len = DW_BLAST_CHUNK;
+        uint8_t *buf;
+        if (dst == DW_WINDOW_ADDR && head != 0u) {
+            len = head;
+            buf = s_read_buf;
+        } else {
+            end -= DW_BLAST_CHUNK;
+            buf = &s_read_buf[end];
+        }
+        if (s_read_slot(s_active_slot, dst, s_window_tmp, len) != ORA_RESULT_OK ||
+            s_reprogram(s_active_slot, dst, buf, len, 1u) != ORA_RESULT_OK) {
+            break;
+        }
+        for (uint16_t i = 0u; i < len; i++) {
+            buf[i] = s_window_tmp[i];
+        }
+        dst += len;
+    }
+    return done;
+}
+
 static void drivewire_do_read(uint16_t count) {
     // The CoCo is already polling for DW_STATUS_READY, and until now
     // DW_STATUS_ADDR holds the ROM's own byte - so put DW_STATUS_WAIT there
@@ -1544,24 +1603,12 @@ static void drivewire_do_read(uint16_t count) {
 
     s_heartbeat = 0u;  // close the heartbeat window - ready goes out next
 
-    // Lay the response out in DW_WINDOW_ADDR for dwoneread.asm's stack blast,
-    // whose PSHS fills the CoCo's buffer downwards, DW_BLAST_CHUNK bytes at a
-    // time, while its PULU reads the window upwards.  So the chunks go in
-    // reverse: the first count % DW_BLAST_CHUNK bytes (which the CoCo copies
-    // singly, upwards), then the buffer's last chunk, then the one before,
-    // and so on back to the head.  The status still shows the heartbeat's
-    // last value meanwhile, so the CoCo goes on waiting.
-    uint16_t head = count % DW_BLAST_CHUNK;
-    bool laid_out = head == 0u ||
-        s_reprogram(s_active_slot, DW_WINDOW_ADDR, s_read_buf, head, 1u) == ORA_RESULT_OK;
-    uint32_t dst = DW_WINDOW_ADDR + head;
-    for (uint16_t end = count; laid_out && end > head; end -= DW_BLAST_CHUNK) {
-        laid_out = s_reprogram(s_active_slot, dst, &s_read_buf[end - DW_BLAST_CHUNK],
-                               DW_BLAST_CHUNK, 1u) == ORA_RESULT_OK;
-        dst += DW_BLAST_CHUNK;
-    }
+    // Lay the response out - see drivewire_window_swap().  The status still
+    // shows the heartbeat's last value meanwhile, so the CoCo goes on waiting.
+    s_window_swapped = true;
+    uint16_t pieces = drivewire_window_swap(count, DW_WINDOW_PIECES(count));
 
-    if (!laid_out) {
+    if (pieces != DW_WINDOW_PIECES(count)) {
         // The CoCo times out, as it would on a lost reply.
         drivewire_error(DW_ERR_REPROGRAM, DW_WINDOW_ADDR);
     } else {
@@ -1582,11 +1629,19 @@ static void drivewire_do_read(uint16_t count) {
         }
     }
 
-    // Restore the real ROM content at the status address now the session is
-    // over, so the code there is back to exactly what it was assembled as
-    // until the next read session.  DW_WINDOW_ADDR needs no restore - see
-    // its own comment.
+    // Restore the real ROM content at the status address and in the window
+    // now the session is over, so the code there is back to exactly what it
+    // was assembled as until the next read session.  Between the ack and any
+    // code of its own, the CoCo runs DWRead's checksum pass - about 16 cycles
+    // a byte, so ~4ms for a sector and tens of microseconds for the 1 and 2
+    // byte replies - and the swap back is a piece per 7 bytes, so it keeps
+    // ahead in both.  After the CoCo left instead, its next read was the one
+    // that showed it, and this follows at once.
     s_reprogram(s_active_slot, DW_STATUS_ADDR, &s_orig_status_byte, 1u, 1u);
+    if (drivewire_window_swap(count, pieces) != pieces) {
+        drivewire_error(DW_ERR_REPROGRAM, DW_WINDOW_ADDR);
+    }
+    s_window_swapped = false;
 }
 
 // ---------------------------------------------------------------------------
