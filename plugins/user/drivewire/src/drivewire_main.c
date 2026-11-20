@@ -335,14 +335,18 @@ static ora_set_x_pin_enabled_fn_t s_set_x_pin_enabled;
 
 // The Becker port a coco-grub entry can ask for: SCS* ($FF40-$FF5F) on X2 and
 // the CPU's R/W on the socket's OE pin, pin 22, which the boot slot ignores.
-// One ROM answers $FF41 (status, bit 1 set while a byte waits) and $FF42 (the
-// byte) from its own table, and captures every access - see
+// One ROM answers a status register (bit 1 set while a byte waits) and the
+// data register after it from its own table, and captures every access - see
 // drivewire_becker_main().  GPIOs are fire-28-c's, as UART1's are.
-#define BECKER_SCS_GPIO     8u
-#define BECKER_RW_GPIO      11u
-#define BECKER_STATUS_ADDR  0x3F41u   // chip 0 offset of $FF41
-#define BECKER_DATA_ADDR    0x3F42u   // chip 0 offset of $FF42
-#define BECKER_REG_MASK     0x1Fu     // SCS* decodes A0-A4
+//
+// The registers are $FF41 and $FF42, a CoCo's, or $FF49 and $FF4A, a
+// Dragon's, where an entry's flags ask for those: a Dragon DOS such as DOSplus
+// drives its WD2797 at $FF40-$FF43, and its Becker driver keeps clear of it.
+#define BECKER_SCS_GPIO       8u
+#define BECKER_RW_GPIO        11u
+#define BECKER_COCO_STATUS    0x3F41u   // chip 0 offset of $FF41; data at $FF42
+#define BECKER_DRAGON_STATUS  0x3F49u   // chip 0 offset of $FF49; data at $FF4A
+#define BECKER_REG_MASK       0x1Fu     // SCS* decodes A0-A4
 #define BECKER_STATUS_READY 0x02u
 static ora_start_aux_port_fn_t s_start_aux;
 static ora_read_aux_port_fn_t  s_read_aux;
@@ -2375,8 +2379,8 @@ __attribute__((noinline, noreturn)) static void drivewire_grub_main(void);
 // port can't be stopped, so only an entry that asks for it gets it - one that
 // leaves SCS* to a real cartridge, a floppy controller at $FF40 say, must not.
 // A port that won't start is recorded and the entry loads anyway.
-__attribute__((noinline)) static bool drivewire_becker_start(void);
-__attribute__((noinline, noreturn)) static void drivewire_becker_main(void);
+__attribute__((noinline)) static bool drivewire_becker_start(uint16_t status_addr);
+__attribute__((noinline, noreturn)) static void drivewire_becker_main(uint16_t status_addr);
 
 __attribute__((noinline, noreturn)) static void drivewire_grub_load(uint32_t payload) {
     uint8_t socket = (uint8_t)payload;
@@ -2384,7 +2388,8 @@ __attribute__((noinline, noreturn)) static void drivewire_grub_load(uint32_t pay
     uint8_t flags  = (uint8_t)(payload >> 16);
 
     ora_result_t rc;
-    bool becker = (flags & 0x04u) != 0u && drivewire_becker_start();
+    uint16_t becker_status = (flags & 0x08u) ? BECKER_DRAGON_STATUS : BECKER_COCO_STATUS;
+    bool becker = (flags & 0x04u) != 0u && drivewire_becker_start(becker_status);
     bool chip1 = (cart != 0xFFu);
     if (chip1) {
         rc = s_copy_flash_chip(cart, ORA_FLASH_SLOT_FLAG_EXCLUDE_PLUGINS, 0u,
@@ -2407,7 +2412,7 @@ __attribute__((noinline, noreturn)) static void drivewire_grub_load(uint32_t pay
     }
 
     if (becker) {
-        drivewire_becker_main();
+        drivewire_becker_main(becker_status);
     }
 
     // The entry now runs, and nothing in it speaks to this plugin, so stop
@@ -2423,7 +2428,8 @@ __attribute__((noinline, noreturn)) static void drivewire_grub_load(uint32_t pay
 //
 //   the flash slot (plugins excluded) of the ROM for chip 0, the socket;
 //   the flash slot of the ROM for chip 1, on the cartridge select, or 0xFF;
-//   flags - bit 0 answers the cartridge select, bit 2 a Becker port on SCS*;
+//   flags - bit 0 answers the cartridge select, bit 2 a Becker port on SCS*,
+//     and bit 3 puts that port's registers at a Dragon's $FF49/$FF4A;
 //   a check byte, the other three summed and XORed with 0x5A.
 //
 // and loads the entry they name, never to return, or records a bad check
@@ -2446,12 +2452,13 @@ __attribute__((noinline)) static void drivewire_grub_payload(const grub_filter_t
                         (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16));
 }
 
-// Starts the Becker port, or records why it can't and returns false.
+// Starts the Becker port, its status register at chip 0 offset status_addr
+// and its data register after it, or records why it can't and returns false.
 //
 // SCS* must idle high: an X pin nothing is wired to is pulled low, which the
 // port would take for SCS* held active, and it would then drive the bus on
 // every read cycle while R/W is high.
-__attribute__((noinline)) static bool drivewire_becker_start(void) {
+__attribute__((noinline)) static bool drivewire_becker_start(uint16_t status_addr) {
     ora_gpio_info_t info = { .size = sizeof(ora_gpio_info_t) };
     if (s_start_aux == NULL || s_aux_entries == NULL || s_gpio_query == NULL ||
         s_gpio_query(BECKER_SCS_GPIO, &info) != ORA_RESULT_OK || info.level == 0u) {
@@ -2463,7 +2470,7 @@ __attribute__((noinline)) static bool drivewire_becker_start(void) {
         drivewire_error(DW_ERR_BECKER, (uint16_t)(0x200u | rc));
         return false;
     }
-    s_write_aux(BECKER_STATUS_ADDR, 0u);
+    s_write_aux(status_addr, 0u);
 
     // Nothing reads UART1 while the menu runs, so whatever reached it then -
     // line noise, the ESP32 starting up - sits in its FIFO, and may have
@@ -2476,9 +2483,12 @@ __attribute__((noinline)) static bool drivewire_becker_start(void) {
 }
 
 // Bridges the Becker port to UART1, for an entry running a stock Becker
-// HDB-DOS, such as toolshed's hdbdw3bck.  A plain byte pipe: each write to
-// $FF42 goes out on TX, and the bytes the server sends come back one at a time
-// through $FF42, with $FF41's bit 1 set while one waits.
+// HDB-DOS, such as toolshed's hdbdw3bck, or a Dragon DOS's Becker driver.  A
+// plain byte pipe: each write to the data register ($FF42) goes out on TX, and
+// the bytes the server sends come back one at a time through it, with the
+// status register's ($FF41's) bit 1 set while one waits.  status_addr is the
+// status register's chip 0 offset - see BECKER_COCO_STATUS; the registers are
+// named by a CoCo's addresses below.
 //
 // The CoCo polls $FF41 and reads $FF42 when it's set, 26us apart on a CoCo 2,
 // 13us at a CoCo 3's double speed.  So after each $FF42 read the next byte, or
@@ -2520,7 +2530,7 @@ static inline void drivewire_becker_set(const becker_reg_t *reg, const uint8_t *
     }
 }
 
-__attribute__((noinline, noreturn)) static void drivewire_becker_main(void) {
+__attribute__((noinline, noreturn)) static void drivewire_becker_main(uint16_t status_addr) {
     uint8_t  head = 0;      // the byte in $FF42, while shown
     uint16_t count = 0;     // bytes queued, the shown one included
     bool     shown = false; // $FF42 holds s_read_buf[head], $FF41 says so
@@ -2532,9 +2542,10 @@ __attribute__((noinline, noreturn)) static void drivewire_becker_main(void) {
     for (unsigned n = 0; n < 8u; n++) {
         phys_bit[n] = map((uint8_t)(1u << n));
     }
-    ora_result_t rc = s_aux_entries(BECKER_STATUS_ADDR, status.entry, BECKER_MAX_ENTRIES, &status.count);
+    uint16_t data_addr = (uint16_t)(status_addr + 1u);
+    ora_result_t rc = s_aux_entries(status_addr, status.entry, BECKER_MAX_ENTRIES, &status.count);
     if (rc == ORA_RESULT_OK) {
-        rc = s_aux_entries(BECKER_DATA_ADDR, data.entry, BECKER_MAX_ENTRIES, &data.count);
+        rc = s_aux_entries(data_addr, data.entry, BECKER_MAX_ENTRIES, &data.count);
     }
     if (rc != ORA_RESULT_OK) {
         drivewire_error(DW_ERR_BECKER, (uint16_t)(0x400u | rc));
@@ -2568,7 +2579,7 @@ __attribute__((noinline, noreturn)) static void drivewire_becker_main(void) {
         uint32_t start = BECKER_TIMERAWL;
         ora_aux_port_access_t a;
         if (s_read_aux(&a) == ORA_RESULT_OK &&
-            (a.addr & BECKER_REG_MASK) == (BECKER_DATA_ADDR & BECKER_REG_MASK)) {
+            (a.addr & BECKER_REG_MASK) == (data_addr & BECKER_REG_MASK)) {
             if (a.is_write) {
                 drivewire_uart_putc(a.data);
             } else if (shown) {
