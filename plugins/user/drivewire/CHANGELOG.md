@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [1.5.0] - 2026-11-20
 
 - Serves DOSplus 5 on a Dragon, through the DW42 extender's onerom build. Each read now puts the ROM's own bytes back in the reply window at $E000, where that image has code.
 - coco-grub entries can ask for a Becker port, at a CoCo's $FF41/$FF42 or a Dragon's $FF49/$FF4A, which the plugin bridges to UART1, so a stock Becker DOS reaches FujiNet without the cartridge.
